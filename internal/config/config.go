@@ -15,7 +15,15 @@ import (
 )
 
 type Config struct {
-	Listen             string        `json:"listen"`
+	// Deprecated: use HttpListen/HttpEnabled.
+	Listen string `json:"listen"`
+
+	HTTPEnabled bool   `json:"httpEnabled"`
+	HttpListen  string `json:"httpListen"`
+
+	HTTPSEnabled bool   `json:"httpsEnabled"`
+	HttpsListen  string `json:"httpsListen"`
+
 	Origin             string        `json:"origin"`
 	CacheDir           string        `json:"cacheDir"`
 	TTL                time.Duration `json:"ttl"`
@@ -23,14 +31,17 @@ type Config struct {
 	AgeHeader          bool          `json:"ageHeader"`
 	UseOriginHost      bool          `json:"useOriginHost"`
 	InsecureSkipVerify bool          `json:"insecureSkipVerify"`
+
+	LogFile string `json:"logFile"`
 }
 
 func Default() Config {
 	return Config{
-		Listen:   "0.0.0.0:3128",
-		CacheDir: "./cache",
-		TTL:      10 * time.Minute,
-		Cache:    nil,
+		HTTPEnabled: true,
+		HttpListen:  "0.0.0.0:3128",
+		CacheDir:    "./cache",
+		TTL:         10 * time.Minute,
+		Cache:       nil,
 	}
 }
 
@@ -38,8 +49,14 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Origin) == "" {
 		return errors.New("origin is required")
 	}
-	if strings.TrimSpace(c.Listen) == "" {
-		return errors.New("listen is required")
+	if !c.HTTPEnabled && !c.HTTPSEnabled {
+		return errors.New("at least one listener must be enabled (http or https)")
+	}
+	if c.HTTPEnabled && strings.TrimSpace(c.HttpListen) == "" {
+		return errors.New("httpListen is required when http is enabled")
+	}
+	if c.HTTPSEnabled && strings.TrimSpace(c.HttpsListen) == "" {
+		return errors.New("httpsListen is required when https is enabled")
 	}
 	if strings.TrimSpace(c.CacheDir) == "" {
 		return errors.New("cacheDir is required")
@@ -62,7 +79,12 @@ func Parse(args []string) (Config, error) {
 		configPath    string
 		origin        string
 		listen        string
+		httpListen    string
+		httpsListen   string
+		httpEnabled   boolFlag
+		httpsEnabled  boolFlag
 		cacheDir      string
+		logFile       string
 		ttl           time.Duration
 		ageHeader     bool
 		useOriginHost bool
@@ -73,8 +95,13 @@ func Parse(args []string) (Config, error) {
 
 	fs.StringVar(&configPath, "config", "", "path to JSON config file")
 	fs.StringVar(&origin, "origin", "", "upstream origin URL to proxy (required), e.g. https://example.com")
-	fs.StringVar(&listen, "listen", cfg.Listen, "listen address (host:port)")
+	fs.StringVar(&listen, "listen", "", "DEPRECATED: alias for --http-listen")
+	fs.StringVar(&httpListen, "http-listen", cfg.HttpListen, "HTTP listen address (host:port), empty disables HTTP")
+	fs.StringVar(&httpsListen, "https-listen", "", "HTTPS listen address (host:port), empty disables HTTPS")
+	fs.Var(&httpEnabled, "http", "enable/disable HTTP listener (default true)")
+	fs.Var(&httpsEnabled, "https", "enable/disable HTTPS listener (default false)")
 	fs.StringVar(&cacheDir, "cache-dir", cfg.CacheDir, "cache directory path")
+	fs.StringVar(&logFile, "log-file", "", "optional log file path (also logs to stdout)")
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
 	fs.BoolVar(&ageHeader, "age-header", false, "add standard Age header on cache HIT")
 	fs.BoolVar(&useOriginHost, "use-origin-host", false, "send Host header from --origin (default: forward the original client Host)")
@@ -99,11 +126,30 @@ func Parse(args []string) (Config, error) {
 	if origin != "" {
 		cfg.Origin = origin
 	}
-	if listen != "" {
-		cfg.Listen = listen
+	if listen != "" && httpListen == cfg.HttpListen {
+		// deprecated --listen provided; treat it as http listen
+		httpListen = listen
+	}
+	// If user explicitly passes an empty http-listen, it disables HTTP.
+	if httpListen == "" {
+		cfg.HttpListen = ""
+	} else {
+		cfg.HttpListen = httpListen
+	}
+	if httpsListen != "" {
+		cfg.HttpsListen = httpsListen
+	}
+	if httpEnabled.set {
+		cfg.HTTPEnabled = httpEnabled.v
+	}
+	if httpsEnabled.set {
+		cfg.HTTPSEnabled = httpsEnabled.v
 	}
 	if cacheDir != "" {
 		cfg.CacheDir = cacheDir
+	}
+	if logFile != "" {
+		cfg.LogFile = logFile
 	}
 	if ttl != 0 {
 		cfg.TTL = ttl
@@ -122,6 +168,16 @@ func Parse(args []string) (Config, error) {
 	}
 
 	normalizeOriginAndTLSDefaults(&cfg, fileExplicit.insecureSkipVerifySet || insecureTLS.set)
+
+	// Default enablement behavior:
+	// - If httpsListen is provided, enable HTTPS.
+	// - If httpListen is empty, disable HTTP.
+	if cfg.HttpsListen != "" && !httpsEnabled.set {
+		cfg.HTTPSEnabled = true
+	}
+	if cfg.HttpListen == "" && !httpEnabled.set {
+		cfg.HTTPEnabled = false
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -170,8 +226,13 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	}
 	var raw struct {
 		Listen             *string  `json:"listen"`
+		HTTPEnabled        *bool    `json:"httpEnabled"`
+		HttpListen         *string  `json:"httpListen"`
+		HTTPSEnabled       *bool    `json:"httpsEnabled"`
+		HttpsListen        *string  `json:"httpsListen"`
 		Origin             *string  `json:"origin"`
 		CacheDir           *string  `json:"cacheDir"`
+		LogFile            *string  `json:"logFile"`
 		TTL                *string  `json:"ttl"`
 		Cache              []string `json:"cache"`
 		AgeHeader          *bool    `json:"ageHeader"`
@@ -189,11 +250,26 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	if raw.Listen != nil {
 		cfg.Listen = *raw.Listen
 	}
+	if raw.HTTPEnabled != nil {
+		cfg.HTTPEnabled = *raw.HTTPEnabled
+	}
+	if raw.HttpListen != nil {
+		cfg.HttpListen = *raw.HttpListen
+	}
+	if raw.HTTPSEnabled != nil {
+		cfg.HTTPSEnabled = *raw.HTTPSEnabled
+	}
+	if raw.HttpsListen != nil {
+		cfg.HttpsListen = *raw.HttpsListen
+	}
 	if raw.Origin != nil {
 		cfg.Origin = *raw.Origin
 	}
 	if raw.CacheDir != nil {
 		cfg.CacheDir = *raw.CacheDir
+	}
+	if raw.LogFile != nil {
+		cfg.LogFile = *raw.LogFile
 	}
 	if raw.TTL != nil {
 		d, err := time.ParseDuration(*raw.TTL)
@@ -217,6 +293,12 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		exp.insecureSkipVerifySet = true
 	}
 	normalizeOriginAndTLSDefaults(&cfg, exp.insecureSkipVerifySet)
+
+	// Back-compat: if legacy listen was set in config file, treat it as HttpListen.
+	if cfg.HttpListen == "" && cfg.Listen != "" {
+		cfg.HttpListen = cfg.Listen
+		cfg.HTTPEnabled = true
+	}
 	return cfg, exp, nil
 }
 

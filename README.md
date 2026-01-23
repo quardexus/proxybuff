@@ -2,7 +2,7 @@
 
 High-load HTTP reverse proxy with disk-backed TTL cache for selected paths.
 
-Developed by **Quardexus**. Version **v1.0.0**.
+Developed by **Quardexus**. Version **v1.1.0**.
 
 ## What it does
 
@@ -94,6 +94,30 @@ Notes:
 
 - Container entrypoint writes the effective config to `/etc/proxybuff/config.json` and starts the service.
 
+### HTTPS (automatic Let's Encrypt certificates)
+
+If you enable HTTPS, ProxyBuff will obtain and renew certificates automatically using ACME (Let's Encrypt).
+
+Requirements:
+
+- Your domain must point to this server (public DNS).
+- Port **80/tcp** must be reachable from the Internet for HTTP-01 challenges.
+- Port **443/tcp** (or your chosen HTTPS port) must be reachable for clients.
+
+Example (container):
+
+```bash
+docker run -d --name proxybuff \
+  --restart unless-stopped \
+  -p 80:80 \
+  -p 443:443 \
+  -v proxybuff-cache:/var/lib/proxybuff/cache \
+  proxybuff:local \
+  --origin https://example.com \
+  --https-listen 0.0.0.0:443 \
+  --http-listen 0.0.0.0:80
+```
+
 ### Clear cache (inside container)
 
 ```bash
@@ -110,12 +134,17 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 
 - `--origin` (required): upstream origin URL. You can pass a full URL (`https://example.com:443`) or omit the scheme.
   - If scheme is omitted and origin is a **hostname**, it defaults to `http://` (port 80).
-  - If scheme is omitted and origin is an **IP**, ProxyBuff will probe the port once on startup to detect TLS and pick `http://` or `https://`.
+  - If scheme is omitted and origin is an **IP**, ProxyBuff probes the port once on startup to detect TLS and picks `http://` or `https://`.
     If it detects TLS, it also enables `--insecure-skip-verify` by default.
-- `--listen` (default `0.0.0.0:3128`): listen address
+- `--listen` (deprecated): alias for `--http-listen`
+- `--http` (default `true`): enable/disable HTTP listener
+- `--http-listen` (default `0.0.0.0:3128`): HTTP listen address (empty disables)
+- `--https` (default `false`): enable/disable HTTPS listener
+- `--https-listen` (default empty): HTTPS listen address (empty disables)
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)
+- `--log-file` (default empty): optional log file path (also logs to stdout)
 - `--age-header` (default `false`): add standard `Age` header on cache HIT
 - `--use-origin-host` (default `false`): send `Host` from `--origin` (by default forwards the original client `Host`)
 - `--insecure-skip-verify` (default `false`): skip TLS certificate verification for https origins (dangerous)

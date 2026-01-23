@@ -196,11 +196,14 @@ func runServers(cfg config.Config, h http.Handler) error {
 	if cfg.HTTPEnabled {
 		handler := h
 		if certMgr != nil {
-			handler = certMgr.HTTPHandler(handler)
+			// When HTTPS is enabled, use HTTP only for ACME HTTP-01 challenges and redirect everything else.
+			handler = certMgr.HTTPHandler(redirectToHTTPSHandler(cfg.HttpsListen))
+			log.Printf("http enabled: listen=%s (acme http-01 + redirect to https)", cfg.HttpListen)
+		} else {
+			log.Printf("http enabled: listen=%s", cfg.HttpListen)
 		}
 		srv := &http.Server{Addr: cfg.HttpListen, Handler: handler}
 		started++
-		log.Printf("http enabled: listen=%s", cfg.HttpListen)
 		go func() {
 			err := srv.ListenAndServe()
 			if err != nil && err != http.ErrServerClosed {
@@ -231,6 +234,53 @@ func runServers(cfg config.Config, h http.Handler) error {
 	}
 
 	return <-errCh
+}
+
+func redirectToHTTPSHandler(httpsListen string) http.Handler {
+	httpsPort := portFromListenAddr(httpsListen)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := hostWithPort(r.Host, httpsPort)
+		target := "https://" + host + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	})
+}
+
+func portFromListenAddr(addr string) string {
+	// addr can be "0.0.0.0:443", ":443", "127.0.0.1:8443"
+	if addr == "" {
+		return "443"
+	}
+	if strings.HasPrefix(addr, ":") {
+		p := strings.TrimPrefix(addr, ":")
+		if p != "" {
+			return p
+		}
+		return "443"
+	}
+	_, p, err := net.SplitHostPort(addr)
+	if err == nil && p != "" {
+		return p
+	}
+	return "443"
+}
+
+func hostWithPort(hostport string, httpsPort string) string {
+	if strings.TrimSpace(hostport) == "" {
+		return "localhost"
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	// If caller is already using default https port, omit it.
+	if httpsPort == "443" {
+		return host
+	}
+	// Preserve IPv6 bracket formatting if needed.
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return host + ":" + httpsPort
 }
 
 func isPort(addr, port string) bool {

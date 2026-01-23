@@ -104,6 +104,10 @@ Requirements:
 - Port **80/tcp** must be reachable from the Internet for HTTP-01 challenges.
 - Port **443/tcp** (or your chosen HTTPS port) must be reachable for clients.
 
+Behavior:
+
+- When HTTPS is enabled, the HTTP listener is used for ACME HTTP-01 challenges and redirects all other requests to HTTPS.
+
 Example (container):
 
 ```bash

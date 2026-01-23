@@ -108,13 +108,16 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 
 ## Flags
 
-- `--origin` (required): upstream origin URL, e.g. `https://example.com:443` or `10.0.0.10:8080` (defaults to `http` if scheme is omitted)
+- `--origin` (required): upstream origin URL. You can pass a full URL (`https://example.com:443`) or omit the scheme.
+  - If scheme is omitted and origin is a **hostname**, it defaults to `http://` (port 80).
+  - If scheme is omitted and origin is an **IP**, it defaults to `https://` and enables `--insecure-skip-verify` by default.
 - `--listen` (default `0.0.0.0:3128`): listen address
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)
 - `--age-header` (default `false`): add standard `Age` header on cache HIT
 - `--use-origin-host` (default `false`): send `Host` from `--origin` (by default forwards the original client `Host`)
+- `--insecure-skip-verify` (default `false`): skip TLS certificate verification for https origins (dangerous)
 
 ## License
 

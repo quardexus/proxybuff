@@ -70,13 +70,14 @@ Usage:
   proxybuff --version
 
 Flags:
-  --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme (defaults to http).
+  --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme.
   --listen      Listen address (host:port), default 0.0.0.0:3128
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
   --ttl         Cache TTL duration (default 10m)
   --cache-dir   Cache directory path (default ./cache)
   --age-header  Add standard Age header on cache HIT (optional)
   --use-origin-host  Send Host header from --origin (default: forward original client Host)
+  --insecure-skip-verify  Skip TLS certificate verification for https origins (dangerous)
   --config      Read JSON config file (unknown keys rejected)
   --write-effective-config  Write effective config JSON to a file (for Docker entrypoint)
 
@@ -106,23 +107,25 @@ func stripWriteEffectiveConfig(args []string, outPath *string) []string {
 
 func writeEffectiveConfig(path string, cfg config.Config) error {
 	type fileCfg struct {
-		Listen        string   `json:"listen"`
-		Origin        string   `json:"origin"`
-		CacheDir      string   `json:"cacheDir"`
-		TTL           string   `json:"ttl"`
-		Cache         []string `json:"cache"`
-		AgeHeader     bool     `json:"ageHeader"`
-		UseOriginHost bool     `json:"useOriginHost"`
+		Listen             string   `json:"listen"`
+		Origin             string   `json:"origin"`
+		CacheDir           string   `json:"cacheDir"`
+		TTL                string   `json:"ttl"`
+		Cache              []string `json:"cache"`
+		AgeHeader          bool     `json:"ageHeader"`
+		UseOriginHost      bool     `json:"useOriginHost"`
+		InsecureSkipVerify bool     `json:"insecureSkipVerify"`
 	}
 
 	payload := fileCfg{
-		Listen:        cfg.Listen,
-		Origin:        cfg.Origin,
-		CacheDir:      cfg.CacheDir,
-		TTL:           cfg.TTL.String(),
-		Cache:         cfg.Cache,
-		AgeHeader:     cfg.AgeHeader,
-		UseOriginHost: cfg.UseOriginHost,
+		Listen:             cfg.Listen,
+		Origin:             cfg.Origin,
+		CacheDir:           cfg.CacheDir,
+		TTL:                cfg.TTL.String(),
+		Cache:              cfg.Cache,
+		AgeHeader:          cfg.AgeHeader,
+		UseOriginHost:      cfg.UseOriginHost,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	}
 
 	b, err := json.MarshalIndent(payload, "", "  ")

@@ -114,6 +114,7 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)
 - `--age-header` (default `false`): add standard `Age` header on cache HIT
+- `--use-origin-host` (default `false`): send `Host` from `--origin` (by default forwards the original client `Host`)
 
 ## License
 

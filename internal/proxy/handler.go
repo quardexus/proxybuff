@@ -64,6 +64,15 @@ func New(cfg config.Config) (*Handler, error) {
 
 	rp := httputil.NewSingleHostReverseProxy(u)
 	rp.Transport = transport
+	origDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		// Save original host before the default director overwrites it.
+		originalHost := req.Host
+		origDirector(req)
+		if !cfg.UseOriginHost {
+			req.Host = originalHost
+		}
+	}
 	// keep the default error handler behavior (502), but do not log secrets.
 
 	return &Handler{
@@ -200,7 +209,11 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("X-Forwarded-Proto", "http")
 	}
 
-	req.Host = h.origin.Host
+	if h.cfg.UseOriginHost {
+		req.Host = h.origin.Host
+	} else {
+		req.Host = r.Host
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {

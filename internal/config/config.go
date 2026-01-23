@@ -12,12 +12,13 @@ import (
 )
 
 type Config struct {
-	Listen    string        `json:"listen"`
-	Origin    string        `json:"origin"`
-	CacheDir  string        `json:"cacheDir"`
-	TTL       time.Duration `json:"ttl"`
-	Cache     []string      `json:"cache"`
-	AgeHeader bool          `json:"ageHeader"`
+	Listen        string        `json:"listen"`
+	Origin        string        `json:"origin"`
+	CacheDir      string        `json:"cacheDir"`
+	TTL           time.Duration `json:"ttl"`
+	Cache         []string      `json:"cache"`
+	AgeHeader     bool          `json:"ageHeader"`
+	UseOriginHost bool          `json:"useOriginHost"`
 }
 
 func Default() Config {
@@ -54,13 +55,14 @@ func Parse(args []string) (Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		configPath string
-		origin     string
-		listen     string
-		cacheDir   string
-		ttl        time.Duration
-		ageHeader  bool
-		cacheMulti multiString
+		configPath    string
+		origin        string
+		listen        string
+		cacheDir      string
+		ttl           time.Duration
+		ageHeader     bool
+		useOriginHost bool
+		cacheMulti    multiString
 	)
 
 	fs.StringVar(&configPath, "config", "", "path to JSON config file")
@@ -69,6 +71,7 @@ func Parse(args []string) (Config, error) {
 	fs.StringVar(&cacheDir, "cache-dir", cfg.CacheDir, "cache directory path")
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
 	fs.BoolVar(&ageHeader, "age-header", false, "add standard Age header on cache HIT")
+	fs.BoolVar(&useOriginHost, "use-origin-host", false, "send Host header from --origin (default: forward the original client Host)")
 	fs.Var(&cacheMulti, "cache", "cache path patterns (repeatable). '*' matches any chars including '/'. '/' caches only root path.")
 
 	if err := fs.Parse(args); err != nil {
@@ -99,6 +102,9 @@ func Parse(args []string) (Config, error) {
 	}
 	if ageHeader {
 		cfg.AgeHeader = true
+	}
+	if useOriginHost {
+		cfg.UseOriginHost = true
 	}
 	if len(cacheMulti.items) > 0 {
 		cfg.Cache = normalizeCachePatterns(cacheMulti.items)
@@ -146,12 +152,13 @@ func readConfigFile(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
 	var raw struct {
-		Listen    *string  `json:"listen"`
-		Origin    *string  `json:"origin"`
-		CacheDir  *string  `json:"cacheDir"`
-		TTL       *string  `json:"ttl"`
-		Cache     []string `json:"cache"`
-		AgeHeader *bool    `json:"ageHeader"`
+		Listen        *string  `json:"listen"`
+		Origin        *string  `json:"origin"`
+		CacheDir      *string  `json:"cacheDir"`
+		TTL           *string  `json:"ttl"`
+		Cache         []string `json:"cache"`
+		AgeHeader     *bool    `json:"ageHeader"`
+		UseOriginHost *bool    `json:"useOriginHost"`
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -182,6 +189,9 @@ func readConfigFile(path string) (Config, error) {
 	}
 	if raw.AgeHeader != nil {
 		cfg.AgeHeader = *raw.AgeHeader
+	}
+	if raw.UseOriginHost != nil {
+		cfg.UseOriginHost = *raw.UseOriginHost
 	}
 	return cfg, nil
 }

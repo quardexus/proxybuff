@@ -61,16 +61,16 @@ go build -o proxybuff ./cmd/proxybuff
 docker build -t proxybuff:local .
 ```
 
-### One-shot run (pull + run)
+### Run
 
-Run:
+Run the container from the locally built image:
 
 ```bash
 docker run -d --name proxybuff \
   --restart unless-stopped \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
-  registry.example.com/quardexus/proxybuff:v1.0.0 \
+  proxybuff:local \
   --origin https://example.com \
   --ttl 10m \
   --cache "/" \
@@ -84,7 +84,7 @@ docker run -d --name proxybuff \
   --restart unless-stopped \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
-  registry.example.com/quardexus/proxybuff:v1.0.0 \
+  proxybuff:local \
   --origin https://example.com \
   --ttl 10m \
   --cache "/,*.png,*.jpg,*.webp,/assets/*"
@@ -92,7 +92,6 @@ docker run -d --name proxybuff \
 
 Notes:
 
-- Replace `registry.example.com/quardexus/proxybuff:v1.0.0` with your published image reference.
 - Container entrypoint writes the effective config to `/etc/proxybuff/config.json` and starts the service.
 
 ### Clear cache (inside container)

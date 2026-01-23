@@ -10,6 +10,12 @@ Developed by **Quardexus**. Version **v1.1.0**.
 - For paths matching configured cache patterns, it **stores the response body on disk** and serves it from cache until TTL expires.
 - On **cache HIT**, it performs **zero requests** to the origin.
 
+## Terms used in this README
+
+- **Public domain**: the hostname clients use to reach ProxyBuff (e.g. `multidex.online`).
+- **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
+- **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
+
 ## Caching rules (v1.1.0)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
@@ -45,7 +51,7 @@ go build -o proxybuff ./cmd/proxybuff
 
 ```bash
 ./proxybuff \
-  --origin https://example.com \
+  --origin https://origin.example.com \
   --http=3128 \
   --ttl 10m \
   --cache "/" \
@@ -71,7 +77,7 @@ docker run -d --name proxybuff \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
   proxybuff:local \
-  --origin https://example.com \
+  --origin https://origin.example.com \
   --ttl 10m \
   --cache "/" \
   --cache "*.png"
@@ -85,7 +91,7 @@ docker run -d --name proxybuff \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
   proxybuff:local \
-  --origin https://example.com \
+  --origin https://origin.example.com \
   --ttl 10m \
   --cache "/,*.png,*.jpg,*.webp,/assets/*"
 ```
@@ -100,7 +106,7 @@ If you enable HTTPS, ProxyBuff will obtain and renew certificates automatically 
 
 Requirements:
 
-- Your domain must point to this server (public DNS).
+- Your **public domain** must point to this server (public DNS).
 - Port **80/tcp** must be reachable from the Internet for HTTP-01 challenges.
 - Port **443/tcp** (or your chosen HTTPS port) must be reachable for clients.
 
@@ -118,9 +124,9 @@ docker run -d --name proxybuff \
   -p 80:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
   proxybuff:local \
-  --origin https://example.com \
+  --origin https://origin.example.com \
   --https=443 \
-  --tls-domain example.com
+  --tls-domain public.example.com
 ```
 
 ### Clear cache (inside container)

@@ -63,17 +63,14 @@ docker build -t proxybuff:local .
 
 ### One-shot run (pull + run)
 
-Image:
-
-- `docker.q-server.net:5000/quardexus/proxybuff:v1.0.0`
-
 Run:
 
 ```bash
-docker run --rm \
+docker run -d --name proxybuff \
+  --restart unless-stopped \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
-  docker.q-server.net:5000/quardexus/proxybuff:v1.0.0 \
+  registry.example.com/quardexus/proxybuff:v1.0.0 \
   --origin https://example.com \
   --ttl 10m \
   --cache "/" \
@@ -83,10 +80,11 @@ docker run --rm \
 You can also pass multiple patterns as a comma-separated list:
 
 ```bash
-docker run --rm \
+docker run -d --name proxybuff \
+  --restart unless-stopped \
   -p 3128:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
-  docker.q-server.net:5000/quardexus/proxybuff:v1.0.0 \
+  registry.example.com/quardexus/proxybuff:v1.0.0 \
   --origin https://example.com \
   --ttl 10m \
   --cache "/,*.png,*.jpg,*.webp,/assets/*"
@@ -94,7 +92,7 @@ docker run --rm \
 
 Notes:
 
-- This registry listens on **HTTP port 5000**. Your Docker daemon may require `insecure-registries` configuration to pull from it.
+- Replace `registry.example.com/quardexus/proxybuff:v1.0.0` with your published image reference.
 - Container entrypoint writes the effective config to `/etc/proxybuff/config.json` and starts the service.
 
 ### Clear cache (inside container)

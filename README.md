@@ -1,6 +1,6 @@
 # ProxyBuff
 
-High-load HTTP reverse proxy with disk-backed TTL cache for selected paths.
+High-load HTTP reverse proxy with disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew).
 
 Developed by **Quardexus**. Version **v1.1.0**.
 
@@ -10,7 +10,7 @@ Developed by **Quardexus**. Version **v1.1.0**.
 - For paths matching configured cache patterns, it **stores the response body on disk** and serves it from cache until TTL expires.
 - On **cache HIT**, it performs **zero requests** to the origin.
 
-## Caching rules (v1.0.0)
+## Caching rules (v1.1.0)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.
@@ -46,7 +46,7 @@ go build -o proxybuff ./cmd/proxybuff
 ```bash
 ./proxybuff \
   --origin https://example.com \
-  --listen 0.0.0.0:3128 \
+  --http=3128 \
   --ttl 10m \
   --cache "/" \
   --cache "*.png" \
@@ -107,6 +107,7 @@ Requirements:
 Behavior:
 
 - When HTTPS is enabled, the HTTP listener is used for ACME HTTP-01 challenges and redirects all other requests to HTTPS.
+- Certificates are cached on disk (under `cache/certs` inside the cache dir) and are renewed automatically before expiry.
 
 Example (container):
 

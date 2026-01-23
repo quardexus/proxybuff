@@ -1,0 +1,10 @@
+cache
+./cache
+.git
+.github
+*.log
+*.tmp
+dist
+bin
+*.tar
+

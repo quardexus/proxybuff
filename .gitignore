@@ -1,0 +1,8 @@
+cache/
+./cache/
+bin/
+dist/
+*.log
+*.tmp
+*.tar
+

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -221,7 +222,10 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 
 // normalizeOriginAndTLSDefaults allows passing host[:port][/basepath] without a scheme.
 // Rules:
-// - If scheme is omitted and host is an IP, default scheme becomes https, and InsecureSkipVerify defaults to true (unless explicitly set).
+// - If scheme is omitted and host is an IP, we probe the port once to detect TLS:
+//   - if TLS handshake succeeds, scheme becomes https (and InsecureSkipVerify defaults to true unless explicitly set)
+//   - otherwise scheme becomes http
+//
 // - If scheme is omitted and host is not an IP, default scheme becomes http.
 func normalizeOriginAndTLSDefaults(cfg *Config, insecureSkipVerifyExplicit bool) {
 	origin := strings.TrimSpace(cfg.Origin)
@@ -238,6 +242,7 @@ func normalizeOriginAndTLSDefaults(cfg *Config, insecureSkipVerifyExplicit bool)
 		hostport = hostport[:i]
 	}
 	host := hostport
+	port := ""
 	// Strip port for IPv4/hostname.
 	if strings.HasPrefix(host, "[") {
 		if j := strings.Index(host, "]"); j > 1 {
@@ -251,16 +256,55 @@ func normalizeOriginAndTLSDefaults(cfg *Config, insecureSkipVerifyExplicit bool)
 			host = strings.SplitN(host, ":", 2)[0]
 		}
 	}
+	// Extract port if explicitly present.
+	if strings.HasPrefix(hostport, "[") {
+		if h, p, err := net.SplitHostPort(hostport); err == nil {
+			host = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+			port = p
+		}
+	} else if strings.Count(hostport, ":") == 1 {
+		if _, p, err := net.SplitHostPort(hostport); err == nil {
+			port = p
+		} else {
+			// fallback
+			if parts := strings.SplitN(hostport, ":", 2); len(parts) == 2 {
+				port = parts[1]
+			}
+		}
+	}
+	if port == "" {
+		port = "80"
+	}
 
 	if net.ParseIP(host) != nil {
-		cfg.Origin = "https://" + origin
-		if !insecureSkipVerifyExplicit {
-			cfg.InsecureSkipVerify = true
+		if probeTLS(host, port) {
+			cfg.Origin = "https://" + origin
+			if !insecureSkipVerifyExplicit {
+				cfg.InsecureSkipVerify = true
+			}
+		} else {
+			cfg.Origin = "http://" + origin
 		}
 		return
 	}
 
 	cfg.Origin = "http://" + origin
+}
+
+func probeTLS(host, port string) bool {
+	addr := net.JoinHostPort(host, port)
+	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		return false
+	}
+	_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	tlsConn := tls.Client(conn, &tls.Config{
+		InsecureSkipVerify: true,
+	})
+	err = tlsConn.Handshake()
+	_ = tlsConn.Close()
+	return err == nil
 }
 
 type boolFlag struct {

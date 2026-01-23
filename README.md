@@ -110,7 +110,8 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 
 - `--origin` (required): upstream origin URL. You can pass a full URL (`https://example.com:443`) or omit the scheme.
   - If scheme is omitted and origin is a **hostname**, it defaults to `http://` (port 80).
-  - If scheme is omitted and origin is an **IP**, it defaults to `https://` and enables `--insecure-skip-verify` by default.
+  - If scheme is omitted and origin is an **IP**, ProxyBuff will probe the port once on startup to detect TLS and pick `http://` or `https://`.
+    If it detects TLS, it also enables `--insecure-skip-verify` by default.
 - `--listen` (default `0.0.0.0:3128`): listen address
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration

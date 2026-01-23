@@ -80,6 +80,18 @@ docker run --rm \
   --cache "*.png"
 ```
 
+You can also pass multiple patterns as a comma-separated list:
+
+```bash
+docker run --rm \
+  -p 3128:3128 \
+  -v proxybuff-cache:/var/lib/proxybuff/cache \
+  docker.q-server.net:5000/quardexus/proxybuff:v1.0.0 \
+  --origin https://example.com \
+  --ttl 10m \
+  --cache "/,*.png,*.jpg,*.webp,/assets/*"
+```
+
 Notes:
 
 - This registry listens on **HTTP port 5000**. Your Docker daemon may require `insecure-registries` configuration to pull from it.

@@ -79,10 +79,8 @@ func Parse(args []string) (Config, error) {
 		configPath    string
 		origin        string
 		listen        string
-		httpListen    string
-		httpsListen   string
-		httpEnabled   boolFlag
-		httpsEnabled  boolFlag
+		httpFlag      listenFlag
+		httpsFlag     listenFlag
 		cacheDir      string
 		logFile       string
 		ttl           time.Duration
@@ -95,11 +93,11 @@ func Parse(args []string) (Config, error) {
 
 	fs.StringVar(&configPath, "config", "", "path to JSON config file")
 	fs.StringVar(&origin, "origin", "", "upstream origin URL to proxy (required), e.g. https://example.com")
-	fs.StringVar(&listen, "listen", "", "DEPRECATED: alias for --http-listen")
-	fs.StringVar(&httpListen, "http-listen", cfg.HttpListen, "HTTP listen address (host:port), empty disables HTTP")
-	fs.StringVar(&httpsListen, "https-listen", "", "HTTPS listen address (host:port), empty disables HTTPS")
-	fs.Var(&httpEnabled, "http", "enable/disable HTTP listener (default true)")
-	fs.Var(&httpsEnabled, "https", "enable/disable HTTPS listener (default false)")
+	fs.StringVar(&listen, "listen", "", "DEPRECATED: alias for --http")
+	httpFlag = newListenFlag(&cfg.HTTPEnabled, &cfg.HttpListen, "0.0.0.0:3128", "3128")
+	httpsFlag = newListenFlag(&cfg.HTTPSEnabled, &cfg.HttpsListen, "0.0.0.0:443", "443")
+	fs.Var(&httpFlag, "http", "HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)")
+	fs.Var(&httpsFlag, "https", "HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)")
 	fs.StringVar(&cacheDir, "cache-dir", cfg.CacheDir, "cache directory path")
 	fs.StringVar(&logFile, "log-file", "", "optional log file path (also logs to stdout)")
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
@@ -126,24 +124,9 @@ func Parse(args []string) (Config, error) {
 	if origin != "" {
 		cfg.Origin = origin
 	}
-	if listen != "" && httpListen == cfg.HttpListen {
-		// deprecated --listen provided; treat it as http listen
-		httpListen = listen
-	}
-	// If user explicitly passes an empty http-listen, it disables HTTP.
-	if httpListen == "" {
-		cfg.HttpListen = ""
-	} else {
-		cfg.HttpListen = httpListen
-	}
-	if httpsListen != "" {
-		cfg.HttpsListen = httpsListen
-	}
-	if httpEnabled.set {
-		cfg.HTTPEnabled = httpEnabled.v
-	}
-	if httpsEnabled.set {
-		cfg.HTTPSEnabled = httpsEnabled.v
+	if listen != "" {
+		// deprecated --listen provided; treat it as --http=<value>
+		_ = httpFlag.Set(listen)
 	}
 	if cacheDir != "" {
 		cfg.CacheDir = cacheDir
@@ -168,16 +151,6 @@ func Parse(args []string) (Config, error) {
 	}
 
 	normalizeOriginAndTLSDefaults(&cfg, fileExplicit.insecureSkipVerifySet || insecureTLS.set)
-
-	// Default enablement behavior:
-	// - If httpsListen is provided, enable HTTPS.
-	// - If httpListen is empty, disable HTTP.
-	if cfg.HttpsListen != "" && !httpsEnabled.set {
-		cfg.HTTPSEnabled = true
-	}
-	if cfg.HttpListen == "" && !httpEnabled.set {
-		cfg.HTTPEnabled = false
-	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -405,3 +378,84 @@ func (b *boolFlag) Set(s string) error {
 	return nil
 }
 func (b *boolFlag) IsBoolFlag() bool { return true }
+
+type listenFlag struct {
+	enabled       *bool
+	listen        *string
+	defaultAddr   string
+	defaultPort   string
+	explicitlySet bool
+}
+
+func newListenFlag(enabled *bool, listen *string, defaultAddr, defaultPort string) listenFlag {
+	return listenFlag{
+		enabled:     enabled,
+		listen:      listen,
+		defaultAddr: defaultAddr,
+		defaultPort: defaultPort,
+	}
+}
+
+func (l *listenFlag) String() string {
+	if l.listen == nil {
+		return ""
+	}
+	return *l.listen
+}
+
+func (l *listenFlag) IsBoolFlag() bool { return true }
+
+func (l *listenFlag) Set(s string) error {
+	l.explicitlySet = true
+
+	// Allow --http, --http=true/false, or --http=<port|addr>
+	if v, err := strconv.ParseBool(s); err == nil {
+		*l.enabled = v
+		if v && strings.TrimSpace(*l.listen) == "" {
+			*l.listen = l.defaultAddr
+		}
+		if !v {
+			*l.listen = ""
+		}
+		return nil
+	}
+
+	addr := strings.TrimSpace(s)
+	if addr == "" {
+		*l.enabled = false
+		*l.listen = ""
+		return nil
+	}
+	*l.enabled = true
+	*l.listen = normalizeListen(addr, l.defaultPort)
+	return nil
+}
+
+func normalizeListen(v string, defaultPort string) string {
+	// Allow passing just a port number.
+	if isAllDigits(v) {
+		return "0.0.0.0:" + v
+	}
+	// Allow ":443" style.
+	if strings.HasPrefix(v, ":") {
+		return v
+	}
+	// Otherwise expect host:port.
+	if strings.Contains(v, ":") {
+		return v
+	}
+	// Fallback to "0.0.0.0:<defaultPort>"
+	return "0.0.0.0:" + defaultPort
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}

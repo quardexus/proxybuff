@@ -70,17 +70,15 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `%s %s (Developed by %s)
 
 Usage:
-  proxybuff --origin <url> [--http-listen 0.0.0.0:3128] [--https-listen :443] [--cache <pattern>] [--ttl 10m] [--cache-dir ./cache] [--age-header]
+  proxybuff --origin <url> [--http[=<port|addr>]] [--https[=<port|addr>]] [--cache <pattern>] [--ttl 10m] [--cache-dir ./cache] [--age-header]
   proxybuff --config /path/to/config.json
   proxybuff --version
 
 Flags:
   --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme.
-  --listen      DEPRECATED: alias for --http-listen
-  --http        Enable/disable HTTP listener (default true)
-  --http-listen HTTP listen address (host:port), default 0.0.0.0:3128 (empty disables)
-  --https       Enable/disable HTTPS listener (default false)
-  --https-listen HTTPS listen address (host:port), empty disables
+  --listen      DEPRECATED: alias for --http
+  --http        HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)
+  --https       HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
   --ttl         Cache TTL duration (default 10m)
   --cache-dir   Cache directory path (default ./cache)

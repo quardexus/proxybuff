@@ -114,8 +114,8 @@ docker run -d --name proxybuff \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
   proxybuff:local \
   --origin https://example.com \
-  --https-listen 0.0.0.0:443 \
-  --http-listen 0.0.0.0:80
+  --https=443 \
+  --http=80
 ```
 
 ### Clear cache (inside container)
@@ -136,11 +136,9 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
   - If scheme is omitted and origin is a **hostname**, it defaults to `http://` (port 80).
   - If scheme is omitted and origin is an **IP**, ProxyBuff probes the port once on startup to detect TLS and picks `http://` or `https://`.
     If it detects TLS, it also enables `--insecure-skip-verify` by default.
-- `--listen` (deprecated): alias for `--http-listen`
-- `--http` (default `true`): enable/disable HTTP listener
-- `--http-listen` (default `0.0.0.0:3128`): HTTP listen address (empty disables)
-- `--https` (default `false`): enable/disable HTTPS listener
-- `--https-listen` (default empty): HTTPS listen address (empty disables)
+- `--listen` (deprecated): alias for `--http`
+- `--http` (default `true`): HTTP listener. Accepts `true|false` or port/address (e.g. `8080`, `:8080`, `127.0.0.1:8080`)
+- `--https` (default `false`): HTTPS listener. Accepts `true|false` or port/address (e.g. `443`, `:443`, `127.0.0.1:443`)
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)

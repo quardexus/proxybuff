@@ -70,7 +70,7 @@ Usage:
   proxybuff --version
 
 Flags:
-  --origin      Upstream origin URL to proxy (required)
+  --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme (defaults to http).
   --listen      Listen address (host:port), default 0.0.0.0:3128
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
   --ttl         Cache TTL duration (default 10m)

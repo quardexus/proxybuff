@@ -108,7 +108,7 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 
 ## Flags
 
-- `--origin` (required): upstream origin URL, e.g. `https://example.com:443`
+- `--origin` (required): upstream origin URL, e.g. `https://example.com:443` or `10.0.0.10:8080` (defaults to `http` if scheme is omitted)
 - `--listen` (default `0.0.0.0:3128`): listen address
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration

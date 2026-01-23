@@ -110,6 +110,8 @@ func Parse(args []string) (Config, error) {
 		cfg.Cache = normalizeCachePatterns(cacheMulti.items)
 	}
 
+	cfg.Origin = normalizeOrigin(cfg.Origin)
+
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -193,5 +195,18 @@ func readConfigFile(path string) (Config, error) {
 	if raw.UseOriginHost != nil {
 		cfg.UseOriginHost = *raw.UseOriginHost
 	}
+	cfg.Origin = normalizeOrigin(cfg.Origin)
 	return cfg, nil
+}
+
+func normalizeOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return origin
+	}
+	// Allow passing host[:port][/basepath] without scheme. Default scheme: http (port defaults to 80).
+	if !strings.Contains(origin, "://") {
+		return "http://" + origin
+	}
+	return origin
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,6 +78,7 @@ Flags:
   --listen      DEPRECATED: alias for --http
   --http        HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)
   --https       HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)
+  --tls-domain  TLS domain(s) for ACME certificates when HTTPS is enabled (repeatable or comma-separated)
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
   --ttl         Cache TTL duration (default 10m)
   --cache-dir   Cache directory path (default ./cache)
@@ -120,6 +120,7 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		HttpListen         string   `json:"httpListen"`
 		HTTPSEnabled       bool     `json:"httpsEnabled"`
 		HttpsListen        string   `json:"httpsListen"`
+		TLSDomains         []string `json:"tlsDomains"`
 		Origin             string   `json:"origin"`
 		CacheDir           string   `json:"cacheDir"`
 		LogFile            string   `json:"logFile"`
@@ -136,6 +137,7 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		HttpListen:         cfg.HttpListen,
 		HTTPSEnabled:       cfg.HTTPSEnabled,
 		HttpsListen:        cfg.HttpsListen,
+		TLSDomains:         cfg.TLSDomains,
 		Origin:             cfg.Origin,
 		CacheDir:           cfg.CacheDir,
 		LogFile:            cfg.LogFile,
@@ -178,28 +180,13 @@ func runServers(cfg config.Config, h http.Handler) error {
 	var certMgr *autocert.Manager
 	if cfg.HTTPSEnabled {
 		certDir := filepath.Join(cfg.CacheDir, "certs")
-		log.Printf("https enabled: listen=%s, certCache=%s", cfg.HttpsListen, certDir)
-		log.Printf("acme note: Let's Encrypt HTTP-01 requires port 80 reachable for the requested domain")
+		log.Printf("https enabled: listen=%s, certCache=%s, domains=%s", cfg.HttpsListen, certDir, strings.Join(cfg.TLSDomains, ","))
+		log.Printf("acme note: ensure external TCP/80 is forwarded to this instance's HTTP listener for HTTP-01 challenges")
 
 		certMgr = &autocert.Manager{
-			Prompt: autocert.AcceptTOS,
-			Cache:  autocert.DirCache(certDir),
-			HostPolicy: func(ctx context.Context, host string) error {
-				host = strings.TrimSpace(host)
-				if host == "" {
-					return fmt.Errorf("acme: empty host")
-				}
-				// refuse IP hosts (LE won't issue for IPs)
-				h := host
-				if strings.Contains(h, ":") {
-					h, _, _ = net.SplitHostPort(host)
-				}
-				if net.ParseIP(h) != nil {
-					return fmt.Errorf("acme: refusing IP host %q", host)
-				}
-				log.Printf("acme: certificate requested for host=%s", host)
-				return nil
-			},
+			Prompt:     autocert.AcceptTOS,
+			Cache:      autocert.DirCache(certDir),
+			HostPolicy: autocert.HostWhitelist(cfg.TLSDomains...),
 		}
 	}
 
@@ -223,23 +210,6 @@ func runServers(cfg config.Config, h http.Handler) error {
 	}
 
 	if certMgr != nil {
-		// Ensure HTTP-01 challenge is served on :80 unless HTTP is already bound to port 80.
-		if !cfg.HTTPEnabled || !isPort(cfg.HttpListen, "80") {
-			acmeSrv := &http.Server{
-				Addr:              ":80",
-				Handler:           certMgr.HTTPHandler(nil),
-				ReadHeaderTimeout: 5 * time.Second,
-			}
-			started++
-			log.Printf("acme http-01 challenge listener: listen=:80")
-			go func() {
-				err := acmeSrv.ListenAndServe()
-				if err != nil && err != http.ErrServerClosed {
-					errCh <- fmt.Errorf("acme http-01 listen: %w", err)
-				}
-			}()
-		}
-
 		httpsSrv := &http.Server{
 			Addr:              cfg.HttpsListen,
 			Handler:           h,

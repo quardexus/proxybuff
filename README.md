@@ -109,13 +109,13 @@ Example (container):
 ```bash
 docker run -d --name proxybuff \
   --restart unless-stopped \
-  -p 80:80 \
   -p 443:443 \
+  -p 80:3128 \
   -v proxybuff-cache:/var/lib/proxybuff/cache \
   proxybuff:local \
   --origin https://example.com \
   --https=443 \
-  --http=80
+  --tls-domain example.com
 ```
 
 ### Clear cache (inside container)
@@ -139,6 +139,7 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 - `--listen` (deprecated): alias for `--http`
 - `--http` (default `true`): HTTP listener. Accepts `true|false` or port/address (e.g. `8080`, `:8080`, `127.0.0.1:8080`)
 - `--https` (default `false`): HTTPS listener. Accepts `true|false` or port/address (e.g. `443`, `:443`, `127.0.0.1:443`)
+- `--tls-domain` (repeatable): domain(s) to request and renew ACME certificates for when HTTPS is enabled
 - `--cache` (repeatable, default empty): cache patterns
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)

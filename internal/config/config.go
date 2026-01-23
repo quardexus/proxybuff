@@ -24,6 +24,8 @@ type Config struct {
 	HTTPSEnabled bool   `json:"httpsEnabled"`
 	HttpsListen  string `json:"httpsListen"`
 
+	TLSDomains []string `json:"tlsDomains"`
+
 	Origin             string        `json:"origin"`
 	CacheDir           string        `json:"cacheDir"`
 	TTL                time.Duration `json:"ttl"`
@@ -58,6 +60,9 @@ func (c *Config) Validate() error {
 	if c.HTTPSEnabled && strings.TrimSpace(c.HttpsListen) == "" {
 		return errors.New("httpsListen is required when https is enabled")
 	}
+	if c.HTTPSEnabled && len(c.TLSDomains) == 0 {
+		return errors.New("tlsDomains is required when https is enabled (use --tls-domain)")
+	}
 	if strings.TrimSpace(c.CacheDir) == "" {
 		return errors.New("cacheDir is required")
 	}
@@ -76,19 +81,20 @@ func Parse(args []string) (Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		configPath    string
-		origin        string
-		listen        string
-		httpFlag      listenFlag
-		httpsFlag     listenFlag
-		cacheDir      string
-		logFile       string
-		ttl           time.Duration
-		ageHeader     bool
-		useOriginHost bool
-		insecureTLS   boolFlag
-		cacheMulti    multiString
-		fileExplicit  fileExplicit
+		configPath     string
+		origin         string
+		listen         string
+		httpFlag       listenFlag
+		httpsFlag      listenFlag
+		cacheDir       string
+		logFile        string
+		ttl            time.Duration
+		ageHeader      bool
+		useOriginHost  bool
+		insecureTLS    boolFlag
+		cacheMulti     multiString
+		tlsDomainMulti multiString
+		fileExplicit   fileExplicit
 	)
 
 	fs.StringVar(&configPath, "config", "", "path to JSON config file")
@@ -98,6 +104,7 @@ func Parse(args []string) (Config, error) {
 	httpsFlag = newListenFlag(&cfg.HTTPSEnabled, &cfg.HttpsListen, "0.0.0.0:443", "443")
 	fs.Var(&httpFlag, "http", "HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)")
 	fs.Var(&httpsFlag, "https", "HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)")
+	fs.Var(&tlsDomainMulti, "tls-domain", "TLS domain(s) for ACME certificates when HTTPS is enabled (repeatable or comma-separated)")
 	fs.StringVar(&cacheDir, "cache-dir", cfg.CacheDir, "cache directory path")
 	fs.StringVar(&logFile, "log-file", "", "optional log file path (also logs to stdout)")
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
@@ -145,6 +152,9 @@ func Parse(args []string) (Config, error) {
 	}
 	if insecureTLS.set {
 		cfg.InsecureSkipVerify = insecureTLS.v
+	}
+	if len(tlsDomainMulti.items) > 0 {
+		cfg.TLSDomains = normalizeCachePatterns(tlsDomainMulti.items)
 	}
 	if len(cacheMulti.items) > 0 {
 		cfg.Cache = normalizeCachePatterns(cacheMulti.items)
@@ -203,6 +213,7 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		HttpListen         *string  `json:"httpListen"`
 		HTTPSEnabled       *bool    `json:"httpsEnabled"`
 		HttpsListen        *string  `json:"httpsListen"`
+		TLSDomains         []string `json:"tlsDomains"`
 		Origin             *string  `json:"origin"`
 		CacheDir           *string  `json:"cacheDir"`
 		LogFile            *string  `json:"logFile"`
@@ -234,6 +245,9 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	}
 	if raw.HttpsListen != nil {
 		cfg.HttpsListen = *raw.HttpsListen
+	}
+	if raw.TLSDomains != nil {
+		cfg.TLSDomains = normalizeCachePatterns(raw.TLSDomains)
 	}
 	if raw.Origin != nil {
 		cfg.Origin = *raw.Origin

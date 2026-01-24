@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quardexus/proxybuff/internal/cache"
@@ -119,10 +120,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Serialize cache fills per-key.
 	key := cache.KeyForPath(path)
-	unlock := h.locks.Lock(key)
+
+	// Non-blocking lock: if another client is already fetching this file,
+	// we do not wait. We simply bypass the cache for this request and
+	// stream directly from upstream to ensure low latency for everyone.
+	unlock, ok := h.locks.TryLock(key)
+	if !ok {
+		h.proxy.ServeHTTP(w, r)
+		return
+	}
 	defer unlock()
 
-	// Re-check after acquiring lock.
+	// Re-check after acquiring lock (though with TryLock this is less likely to change,
+	// but good practice if we ever revert to blocking).
 	now = time.Now()
 	meta, f, ok, err = h.cacheDisk.LoadFresh(path, now)
 	if err != nil {
@@ -179,6 +189,13 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, meta *c
 		return
 	}
 	_, _ = io.Copy(w, f)
+}
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		// 32KB buffer
+		return make([]byte, 32*1024)
+	},
 }
 
 func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
@@ -244,57 +261,139 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bodyFile, err := os.Create(tmpBody)
-	if err != nil {
-		_, _ = io.Copy(w, resp.Body)
-		return
-	}
-	defer func() {
-		_ = bodyFile.Close()
+	// Async writer setup
+	// 8MB buffer for async disk writes
+	diskCh := make(chan []byte, 8*1024*1024/(32*1024)) // approx slots for 32k chunks to total 8MB
+	diskErrCh := make(chan error, 1)
+	var diskCloseOnce sync.Once
+	closeDisk := func() { diskCloseOnce.Do(func() { close(diskCh) }) }
+
+	// Start background writer
+	go func() {
+		defer close(diskErrCh)
+
+		f, err := os.Create(tmpBody)
+		if err != nil {
+			diskErrCh <- err
+			return
+		}
+		defer f.Close()
+
+		for b := range diskCh {
+			if _, err := f.Write(b); err != nil {
+				diskErrCh <- err
+				// drain channel to not block sender, and put buffers back
+				bufPool.Put(b)
+				for remaining := range diskCh {
+					bufPool.Put(remaining)
+				}
+				return
+			}
+			bufPool.Put(b) // Return buffer to pool after writing to disk
+		}
 	}()
 
 	var (
 		cached       = true
 		cachedBytes  int64
-		copyBuf      = make([]byte, 32*1024)
 		clientClosed = false
+		writeFailed  = false
 	)
 
+	// Cleanup if caching failed or aborted
+	defer func() {
+		if !cached {
+			closeDisk() // Ensure writer finishes
+			// Drain any errors
+			<-diskErrCh
+			_ = os.Remove(tmpMeta)
+			_ = os.Remove(tmpBody)
+		}
+	}()
+
 	for {
-		n, readErr := resp.Body.Read(copyBuf)
+		// Check context before reading to support cancellation
+		select {
+		case <-r.Context().Done():
+			clientClosed = true
+			if cached {
+				cached = false // Abort caching on partial download
+			}
+			return
+		default:
+		}
+
+		buf := bufPool.Get().([]byte)
+		// Reset len only? No, Read takes slice. Cap is 32k.
+		// We use buf[:cap] just to be safe we offer full buffer to Read.
+		// NOTE: New() returns 32k len/cap. TryLock/Put doesn't change cap.
+		// If previous user sliced it to [:100], Put(slice) keeps cap=32k.
+		// But verify: Go slices... passing slice header.
+		// We should re-slice to full capacity before Read.
+		buf = buf[:cap(buf)]
+
+		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			chunk := buf[:n]
+
+			// 1. Send to client
 			if !clientClosed {
-				if _, err := w.Write(copyBuf[:n]); err != nil {
+				if _, err := w.Write(chunk); err != nil {
 					clientClosed = true
+					cached = false
 				}
 			}
-			if cached {
-				if _, err := bodyFile.Write(copyBuf[:n]); err != nil {
+
+			// 2. Send to disk async
+			if cached && !writeFailed {
+				// Hand off ownership of 'chunk' (backed by 'buf') to the writer
+				select {
+				case diskCh <- chunk:
+					// Ownership transferred to writer.
+					// Writer will Put() it back.
+				default:
+					// Channel full - disk too slow
+					writeFailed = true
 					cached = false
-					_ = bodyFile.Close()
-					_ = os.Remove(tmpBody)
-				} else {
-					cachedBytes += int64(n)
+					bufPool.Put(buf) // We kept ownership, so we Put
 				}
+			} else {
+				// Not caching (or failed), we own the buffer, so return it
+				bufPool.Put(buf)
+			}
+
+			cachedBytes += int64(n)
+		} else {
+			// n == 0, if we didn't use the buffer, Put it back immediately
+			if cap(buf) > 0 { // Safety check
+				bufPool.Put(buf)
 			}
 		}
+
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			// Upstream read error; do not cache partial content.
+			// Upstream read error
 			cached = false
 			break
 		}
 	}
 
+	// Close channel to signal writer to finish
+	closeDisk()
+
+	// Wait for writer to finish and check error
+	if err := <-diskErrCh; err != nil {
+		cached = false
+	}
+
 	if !cached {
-		_ = os.Remove(tmpMeta)
-		_ = os.Remove(tmpBody)
+		// Defer handles cleanup
 		return
 	}
 
-	_ = bodyFile.Close()
+	// Rename and save meta...
 	if err := os.Rename(tmpBody, bodyFinal); err != nil {
 		_ = os.Remove(tmpBody)
 		return

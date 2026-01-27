@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/quardexus/proxybuff/internal/config"
@@ -60,7 +63,12 @@ func main() {
 		log.Fatalf("init: %v", err)
 	}
 
-	if err := runServers(cfg, h); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	h.StartBackground(ctx)
+
+	if err := runServers(ctx, cfg, h); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }
@@ -76,10 +84,13 @@ Usage:
 Flags:
   --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme.
   --listen      DEPRECATED: alias for --http
-  --http        HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)
+  --http        HTTP listener (required): port/address (e.g. 8080, :8080, 127.0.0.1:8080)
   --https       HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)
   --tls-domain  TLS domain(s) for ACME certificates when HTTPS is enabled (repeatable or comma-separated)
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
+  --recache     Auto-refresh cached path pattern (repeatable). When an entry is close to expiry, ProxyBuff refreshes it in the background.
+  --recache-ahead    How long before expiry to trigger refresh (default 5m)
+  --recache-workers  Max concurrent background refresh workers (default 2)
   --ttl         Cache TTL duration (default 10m)
   --cache-dir   Cache directory path (default ./cache)
   --log-file    Optional log file path (also logs to stdout)
@@ -126,6 +137,9 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		LogFile            string   `json:"logFile"`
 		TTL                string   `json:"ttl"`
 		Cache              []string `json:"cache"`
+		Recache            []string `json:"recache"`
+		RecacheAhead       string   `json:"recacheAhead"`
+		RecacheWorkers     int      `json:"recacheWorkers"`
 		AgeHeader          bool     `json:"ageHeader"`
 		UseOriginHost      bool     `json:"useOriginHost"`
 		InsecureSkipVerify bool     `json:"insecureSkipVerify"`
@@ -143,6 +157,9 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		LogFile:            cfg.LogFile,
 		TTL:                cfg.TTL.String(),
 		Cache:              cfg.Cache,
+		Recache:            cfg.Recache,
+		RecacheAhead:       cfg.RecacheAhead.String(),
+		RecacheWorkers:     cfg.RecacheWorkers,
 		AgeHeader:          cfg.AgeHeader,
 		UseOriginHost:      cfg.UseOriginHost,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
@@ -174,7 +191,7 @@ func setupLogging(path string) (closeFn func()) {
 	return func() { _ = f.Close() }
 }
 
-func runServers(cfg config.Config, h http.Handler) error {
+func runServers(ctx context.Context, cfg config.Config, h http.Handler) error {
 	log.Printf("%s %s starting, origin=%s", version.Project, version.Version, cfg.Origin)
 
 	var certMgr *autocert.Manager
@@ -192,6 +209,7 @@ func runServers(cfg config.Config, h http.Handler) error {
 
 	errCh := make(chan error, 3)
 	started := 0
+	var servers []*http.Server
 
 	if cfg.HTTPEnabled {
 		handler := h
@@ -203,6 +221,7 @@ func runServers(cfg config.Config, h http.Handler) error {
 			log.Printf("http enabled: listen=%s", cfg.HttpListen)
 		}
 		srv := &http.Server{Addr: cfg.HttpListen, Handler: handler}
+		servers = append(servers, srv)
 		started++
 		go func() {
 			err := srv.ListenAndServe()
@@ -219,6 +238,7 @@ func runServers(cfg config.Config, h http.Handler) error {
 			TLSConfig:         certMgr.TLSConfig(),
 			ReadHeaderTimeout: 15 * time.Second,
 		}
+		servers = append(servers, httpsSrv)
 		started++
 		log.Printf("https enabled: listen=%s", cfg.HttpsListen)
 		go func() {
@@ -233,7 +253,18 @@ func runServers(cfg config.Config, h http.Handler) error {
 		return fmt.Errorf("no listeners started")
 	}
 
-	return <-errCh
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		log.Printf("shutdown requested: %v", ctx.Err())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, srv := range servers {
+			_ = srv.Shutdown(shutdownCtx)
+		}
+		return nil
+	}
 }
 
 func redirectToHTTPSHandler(httpsListen string) http.Handler {

@@ -2,7 +2,7 @@
 
 High-load HTTP reverse proxy with disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew).
 
-Developed by **Quardexus**. Version **v1.1.0**.
+Developed by **Quardexus**. Version **v1.2.0**.
 
 ## What it does
 
@@ -16,7 +16,7 @@ Developed by **Quardexus**. Version **v1.1.0**.
 - **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
 - **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
 
-## Caching rules (v1.1.0)
+## Caching rules (v1.2.0)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.
@@ -40,6 +40,23 @@ Examples:
 - `*.png` caches `/a.png` and `/assets/img/b.png`
 - `/assets/*` caches `/assets/anything/inside/here`
 
+## Auto-refresh cache (recache)
+
+ProxyBuff can proactively **refresh** cached entries in the background even when there are **no client requests**.
+
+How it works:
+
+- You configure `--recache` patterns (same syntax as `--cache`).
+- For each cached entry matching `--recache`, ProxyBuff schedules a refresh at:
+  - `expiresAt - recacheAhead`
+- Refresh is done by a background worker pool (`--recache-workers`) and uses non-blocking per-key locking so it does not stall user traffic.
+- Cached entries survive restarts because the scheduler reads `meta.json` from disk on startup.
+
+Defaults:
+
+- `--recache-ahead=5m`
+- `--recache-workers=2`
+
 ## Install / build locally
 
 ```bash
@@ -56,6 +73,9 @@ go build -o proxybuff ./cmd/proxybuff
   --ttl 10m \
   --cache "/" \
   --cache "*.png" \
+  --recache "/assets/*" \
+  --recache-ahead 5m \
+  --recache-workers 2 \
   --cache-dir ./cache
 ```
 
@@ -80,7 +100,8 @@ docker run -d --name proxybuff \
   --origin https://origin.example.com \
   --ttl 10m \
   --cache "/" \
-  --cache "*.png"
+  --cache "*.png" \
+  --recache "/assets/*"
 ```
 
 You can also pass multiple patterns as a comma-separated list:
@@ -148,10 +169,13 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
   - If scheme is omitted and origin is an **IP**, ProxyBuff probes the port once on startup to detect TLS and picks `http://` or `https://`.
     If it detects TLS, it also enables `--insecure-skip-verify` by default.
 - `--listen` (deprecated): alias for `--http`
-- `--http` (default `true`): HTTP listener. Accepts `true|false` or port/address (e.g. `8080`, `:8080`, `127.0.0.1:8080`)
+- `--http` (required): HTTP listener. Accepts port/address (e.g. `8080`, `:8080`, `127.0.0.1:8080`)
 - `--https` (default `false`): HTTPS listener. Accepts `true|false` or port/address (e.g. `443`, `:443`, `127.0.0.1:443`)
 - `--tls-domain` (repeatable): domain(s) to request and renew ACME certificates for when HTTPS is enabled
 - `--cache` (repeatable, default empty): cache patterns
+- `--recache` (repeatable, default empty): auto-refresh patterns (also implies caching those patterns)
+- `--recache-ahead` (default `5m`): how long before expiry to refresh an entry
+- `--recache-workers` (default `2`): max concurrent background refresh workers
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)
 - `--log-file` (default empty): optional log file path (also logs to stdout)

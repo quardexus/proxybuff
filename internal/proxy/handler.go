@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ type Handler struct {
 	origin    *url.URL
 	cacheDisk cache.Disk
 	matchers  []cache.Matcher
+	recache   *recacheScheduler
 	locks     *keyedLocker
 
 	client *http.Client
@@ -40,6 +42,11 @@ func New(cfg config.Config) (*Handler, error) {
 	}
 
 	matchers, err := cache.CompileMatchers(cfg.Cache)
+	if err != nil {
+		return nil, err
+	}
+
+	recacheMatchers, err := cache.CompileMatchers(cfg.Recache)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +85,7 @@ func New(cfg config.Config) (*Handler, error) {
 	}
 	// keep the default error handler behavior (502), but do not log secrets.
 
-	return &Handler{
+	h := &Handler{
 		cfg:       cfg,
 		origin:    u,
 		cacheDisk: cd,
@@ -86,7 +93,23 @@ func New(cfg config.Config) (*Handler, error) {
 		locks:     newKeyedLocker(),
 		client:    &http.Client{Transport: transport},
 		proxy:     rp,
-	}, nil
+	}
+
+	if len(recacheMatchers) > 0 && cfg.RecacheWorkers > 0 {
+		h.recache = newRecacheScheduler(cd, u, h.client, h.locks, recacheMatchers, cfg.RecacheAhead, cfg.RecacheWorkers)
+	}
+
+	return h, nil
+}
+
+// StartBackground launches background components (like recache scheduler).
+// It is safe to call multiple times.
+func (h *Handler) StartBackground(ctx context.Context) {
+	if h.recache == nil {
+		return
+	}
+	// Start is idempotent enough for our usage (single start from main).
+	h.recache.Start(ctx)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -403,6 +426,7 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 	storedHeader.Set("Content-Length", strconv.FormatInt(cachedBytes, 10))
 
 	meta := &cache.Meta{
+		Path:      r.URL.Path,
 		Status:    resp.StatusCode,
 		Header:    storedHeader,
 		CreatedAt: now,
@@ -414,6 +438,11 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		_ = os.Remove(metaFinal)
 		_ = os.Remove(bodyFinal)
 		return
+	}
+
+	// Notify scheduler if this path is configured for recache.
+	if h.recache != nil {
+		h.recache.Update(r.URL.Path, meta.ExpiresAt)
 	}
 }
 

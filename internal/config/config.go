@@ -30,6 +30,9 @@ type Config struct {
 	CacheDir           string        `json:"cacheDir"`
 	TTL                time.Duration `json:"ttl"`
 	Cache              []string      `json:"cache"`
+	Recache            []string      `json:"recache"`
+	RecacheAhead       time.Duration `json:"recacheAhead"`
+	RecacheWorkers     int           `json:"recacheWorkers"`
 	AgeHeader          bool          `json:"ageHeader"`
 	UseOriginHost      bool          `json:"useOriginHost"`
 	InsecureSkipVerify bool          `json:"insecureSkipVerify"`
@@ -39,11 +42,14 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		HTTPEnabled: true,
-		HttpListen:  "0.0.0.0:3128",
-		CacheDir:    "./cache",
-		TTL:         10 * time.Minute,
-		Cache:       nil,
+		HTTPEnabled:    true,
+		HttpListen:     "0.0.0.0:3128",
+		CacheDir:       "./cache",
+		TTL:            10 * time.Minute,
+		Cache:          nil,
+		Recache:        nil,
+		RecacheAhead:   5 * time.Minute,
+		RecacheWorkers: 2,
 	}
 }
 
@@ -51,8 +57,8 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Origin) == "" {
 		return errors.New("origin is required")
 	}
-	if !c.HTTPEnabled && !c.HTTPSEnabled {
-		return errors.New("at least one listener must be enabled (http or https)")
+	if !c.HTTPEnabled {
+		return errors.New("http listener cannot be disabled")
 	}
 	if c.HTTPEnabled && strings.TrimSpace(c.HttpListen) == "" {
 		return errors.New("httpListen is required when http is enabled")
@@ -69,6 +75,12 @@ func (c *Config) Validate() error {
 	if c.TTL <= 0 {
 		return errors.New("ttl must be > 0")
 	}
+	if c.RecacheAhead < 0 {
+		return errors.New("recacheAhead must be >= 0")
+	}
+	if c.RecacheWorkers < 0 {
+		return errors.New("recacheWorkers must be >= 0")
+	}
 	return nil
 }
 
@@ -84,30 +96,45 @@ func Parse(args []string) (Config, error) {
 		configPath     string
 		origin         string
 		listen         string
+		httpEnabled    bool
+		httpListen     string
+		httpsEnabled   bool
+		httpsListen    string
 		httpFlag       listenFlag
 		httpsFlag      listenFlag
 		cacheDir       string
 		logFile        string
 		ttl            time.Duration
+		recacheAhead   time.Duration
+		recacheWorkers int
 		ageHeader      bool
 		useOriginHost  bool
 		insecureTLS    boolFlag
 		cacheMulti     multiString
+		recacheMulti   multiString
 		tlsDomainMulti multiString
 		fileExplicit   fileExplicit
 	)
 
+	httpEnabled = cfg.HTTPEnabled
+	httpListen = cfg.HttpListen
+	httpsEnabled = cfg.HTTPSEnabled
+	httpsListen = cfg.HttpsListen
+
 	fs.StringVar(&configPath, "config", "", "path to JSON config file")
 	fs.StringVar(&origin, "origin", "", "upstream origin URL to proxy (required), e.g. https://example.com")
 	fs.StringVar(&listen, "listen", "", "DEPRECATED: alias for --http")
-	httpFlag = newListenFlag(&cfg.HTTPEnabled, &cfg.HttpListen, "0.0.0.0:3128", "3128")
-	httpsFlag = newListenFlag(&cfg.HTTPSEnabled, &cfg.HttpsListen, "0.0.0.0:443", "443")
-	fs.Var(&httpFlag, "http", "HTTP listener: bool to enable/disable, or port/address (e.g. 8080, :8080, 127.0.0.1:8080)")
+	httpFlag = newListenFlag(&httpEnabled, &httpListen, "0.0.0.0:3128", "3128", false)
+	httpsFlag = newListenFlag(&httpsEnabled, &httpsListen, "0.0.0.0:443", "443", true)
+	fs.Var(&httpFlag, "http", "HTTP listener (required for ACME HTTP-01 + redirects): port/address (e.g. 8080, :8080, 127.0.0.1:8080)")
 	fs.Var(&httpsFlag, "https", "HTTPS listener: bool to enable/disable, or port/address (e.g. 443, :443, 127.0.0.1:443)")
 	fs.Var(&tlsDomainMulti, "tls-domain", "TLS domain(s) for ACME certificates when HTTPS is enabled (repeatable or comma-separated)")
 	fs.StringVar(&cacheDir, "cache-dir", cfg.CacheDir, "cache directory path")
 	fs.StringVar(&logFile, "log-file", "", "optional log file path (also logs to stdout)")
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
+	fs.Var(&recacheMulti, "recache", "auto-refresh cached path patterns (repeatable). When an entry is close to expiry, ProxyBuff refreshes it in the background.")
+	fs.DurationVar(&recacheAhead, "recache-ahead", cfg.RecacheAhead, "how long before expiry to trigger background refresh (default 5m)")
+	fs.IntVar(&recacheWorkers, "recache-workers", cfg.RecacheWorkers, "max concurrent background refresh workers (default 2)")
 	fs.BoolVar(&ageHeader, "age-header", false, "add standard Age header on cache HIT")
 	fs.BoolVar(&useOriginHost, "use-origin-host", false, "send Host header from --origin (default: forward the original client Host)")
 	fs.Var(&insecureTLS, "insecure-skip-verify", "skip TLS certificate verification for https origins (dangerous)")
@@ -116,6 +143,11 @@ func Parse(args []string) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
 
 	// Load config file first (if provided), then override with flags.
 	if configPath != "" {
@@ -128,37 +160,57 @@ func Parse(args []string) (Config, error) {
 	}
 
 	// Override from flags (only when explicitly provided).
-	if origin != "" {
+	if visited["origin"] {
 		cfg.Origin = origin
 	}
-	if listen != "" {
+	if visited["listen"] {
 		// deprecated --listen provided; treat it as --http=<value>
 		_ = httpFlag.Set(listen)
 	}
-	if cacheDir != "" {
+	if httpFlag.explicitlySet {
+		cfg.HTTPEnabled = httpEnabled
+		cfg.HttpListen = httpListen
+	}
+	if httpsFlag.explicitlySet {
+		cfg.HTTPSEnabled = httpsEnabled
+		cfg.HttpsListen = httpsListen
+	}
+	if visited["cache-dir"] {
 		cfg.CacheDir = cacheDir
 	}
-	if logFile != "" {
+	if visited["log-file"] {
 		cfg.LogFile = logFile
 	}
-	if ttl != 0 {
+	if visited["ttl"] {
 		cfg.TTL = ttl
 	}
-	if ageHeader {
-		cfg.AgeHeader = true
+	if visited["recache"] {
+		cfg.Recache = normalizeCachePatterns(recacheMulti.items)
 	}
-	if useOriginHost {
-		cfg.UseOriginHost = true
+	if visited["recache-ahead"] {
+		cfg.RecacheAhead = recacheAhead
+	}
+	if visited["recache-workers"] {
+		cfg.RecacheWorkers = recacheWorkers
+	}
+	if visited["age-header"] {
+		cfg.AgeHeader = ageHeader
+	}
+	if visited["use-origin-host"] {
+		cfg.UseOriginHost = useOriginHost
 	}
 	if insecureTLS.set {
 		cfg.InsecureSkipVerify = insecureTLS.v
 	}
-	if len(tlsDomainMulti.items) > 0 {
+	if visited["tls-domain"] {
 		cfg.TLSDomains = normalizeCachePatterns(tlsDomainMulti.items)
 	}
-	if len(cacheMulti.items) > 0 {
+	if visited["cache"] {
 		cfg.Cache = normalizeCachePatterns(cacheMulti.items)
 	}
+
+	// Ensure recache patterns are also cached.
+	cfg.Cache = mergeUnique(cfg.Cache, cfg.Recache)
 
 	normalizeOriginAndTLSDefaults(&cfg, fileExplicit.insecureSkipVerifySet || insecureTLS.set)
 
@@ -166,6 +218,29 @@ func Parse(args []string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func mergeUnique(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, v := range a {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range b {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 type multiString struct {
@@ -219,6 +294,9 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		LogFile            *string  `json:"logFile"`
 		TTL                *string  `json:"ttl"`
 		Cache              []string `json:"cache"`
+		Recache            []string `json:"recache"`
+		RecacheAhead       *string  `json:"recacheAhead"`
+		RecacheWorkers     *int     `json:"recacheWorkers"`
 		AgeHeader          *bool    `json:"ageHeader"`
 		UseOriginHost      *bool    `json:"useOriginHost"`
 		InsecureSkipVerify *bool    `json:"insecureSkipVerify"`
@@ -268,6 +346,19 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	if raw.Cache != nil {
 		cfg.Cache = normalizeCachePatterns(raw.Cache)
 	}
+	if raw.Recache != nil {
+		cfg.Recache = normalizeCachePatterns(raw.Recache)
+	}
+	if raw.RecacheAhead != nil {
+		d, err := time.ParseDuration(*raw.RecacheAhead)
+		if err != nil {
+			return Config{}, fileExplicit{}, fmt.Errorf("parse recacheAhead: %w", err)
+		}
+		cfg.RecacheAhead = d
+	}
+	if raw.RecacheWorkers != nil {
+		cfg.RecacheWorkers = *raw.RecacheWorkers
+	}
 	if raw.AgeHeader != nil {
 		cfg.AgeHeader = *raw.AgeHeader
 	}
@@ -280,6 +371,9 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		exp.insecureSkipVerifySet = true
 	}
 	normalizeOriginAndTLSDefaults(&cfg, exp.insecureSkipVerifySet)
+
+	// Ensure recache patterns are also cached.
+	cfg.Cache = mergeUnique(cfg.Cache, cfg.Recache)
 
 	// Back-compat: if legacy listen was set in config file, treat it as HttpListen.
 	if cfg.HttpListen == "" && cfg.Listen != "" {
@@ -398,15 +492,17 @@ type listenFlag struct {
 	listen        *string
 	defaultAddr   string
 	defaultPort   string
+	allowDisable  bool
 	explicitlySet bool
 }
 
-func newListenFlag(enabled *bool, listen *string, defaultAddr, defaultPort string) listenFlag {
+func newListenFlag(enabled *bool, listen *string, defaultAddr, defaultPort string, allowDisable bool) listenFlag {
 	return listenFlag{
-		enabled:     enabled,
-		listen:      listen,
-		defaultAddr: defaultAddr,
-		defaultPort: defaultPort,
+		enabled:      enabled,
+		listen:       listen,
+		defaultAddr:  defaultAddr,
+		defaultPort:  defaultPort,
+		allowDisable: allowDisable,
 	}
 }
 
@@ -424,6 +520,9 @@ func (l *listenFlag) Set(s string) error {
 
 	// Allow --http, --http=true/false, or --http=<port|addr>
 	if v, err := strconv.ParseBool(s); err == nil {
+		if !v && !l.allowDisable {
+			return errors.New("http listener cannot be disabled")
+		}
 		*l.enabled = v
 		if v && strings.TrimSpace(*l.listen) == "" {
 			*l.listen = l.defaultAddr
@@ -436,6 +535,9 @@ func (l *listenFlag) Set(s string) error {
 
 	addr := strings.TrimSpace(s)
 	if addr == "" {
+		if !l.allowDisable {
+			return errors.New("http listener cannot be disabled")
+		}
 		*l.enabled = false
 		*l.listen = ""
 		return nil

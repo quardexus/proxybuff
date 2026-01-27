@@ -105,26 +105,65 @@ func New(cfg config.Config) (*Handler, error) {
 // StartBackground launches background components (like recache scheduler).
 // It is safe to call multiple times.
 func (h *Handler) StartBackground(ctx context.Context) {
-	if h.recache == nil {
-		return
-	}
 	// Start is idempotent enough for our usage (single start from main).
-	h.recache.Start(ctx)
+	if h.recache != nil {
+		h.recache.Start(ctx)
+	}
+
+	// Disk cache garbage collector: delete expired entries periodically.
+	if h.cacheDisk.Dir != "" && h.cacheDisk.TTL > 0 {
+		go func() {
+			t := time.NewTicker(h.cacheDisk.TTL)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					_, _ = h.cacheDisk.SweepExpired(now)
+				}
+			}
+		}()
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// We only cache GET/HEAD without Range.
+	// We only cache GET/HEAD.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		h.proxy.ServeHTTP(w, r)
-		return
-	}
-	if r.Header.Get("Range") != "" {
 		h.proxy.ServeHTTP(w, r)
 		return
 	}
 
 	path := r.URL.Path
-	if !h.shouldCache(path) {
+	cacheable := h.shouldCache(path)
+
+	// Range support (single range): if full file is already cached, serve range from disk.
+	// Otherwise proxy the range request and (if cacheable) fill the full file in background.
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+		if cacheable {
+			now := time.Now()
+			meta, f, ok, err := h.cacheDisk.LoadFresh(path, now)
+			if err != nil {
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+				return
+			}
+			if ok {
+				defer f.Close()
+				if h.serveSingleRangeFromCache(w, r, meta, f, now, rangeHdr) {
+					return
+				}
+			}
+
+			// Cache miss or unsupported range format: still proxy the range request,
+			// but start background full download to populate cache for next time.
+			h.maybeFillFullInBackground(r)
+		}
+
+		h.proxy.ServeHTTP(w, r)
+		return
+	}
+
+	if !cacheable {
 		h.proxy.ServeHTTP(w, r)
 		return
 	}
@@ -187,6 +226,220 @@ func (h *Handler) shouldCache(path string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) serveSingleRangeFromCache(w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time, rangeHdr string) bool {
+	// Only support "bytes=<start>-<end>", "bytes=<start>-", "bytes=-<suffix>" and only a single range.
+	// If unsupported, return false to fallback to proxying.
+	size := meta.Size
+	if size <= 0 {
+		return false
+	}
+	if meta.Status != http.StatusOK {
+		return false
+	}
+
+	start, end, ok := parseSingleByteRange(rangeHdr, size)
+	if !ok {
+		return false
+	}
+
+	// Serve headers from cached meta, plus ProxyBuff diagnostics.
+	copyHeader(w.Header(), meta.Header)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.Header().Set("X-ProxyBuff-Cache", "HIT")
+
+	if h.cfg.AgeHeader {
+		age := int(now.Sub(meta.CreatedAt).Seconds())
+		if age < 0 {
+			age = 0
+		}
+		w.Header().Set("Age", strconv.Itoa(age))
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+	if r.Method == http.MethodHead {
+		return true
+	}
+
+	// Ensure we only read the requested bytes.
+	_, _ = f.Seek(0, io.SeekStart)
+	sr := io.NewSectionReader(f, start, end-start+1)
+	_, _ = io.Copy(w, sr)
+	return true
+}
+
+func parseSingleByteRange(h string, size int64) (start int64, end int64, ok bool) {
+	h = strings.TrimSpace(h)
+	if !strings.HasPrefix(h, "bytes=") {
+		return 0, 0, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(h, "bytes="))
+	if spec == "" {
+		return 0, 0, false
+	}
+	// Only single range supported (no commas).
+	if strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	a := strings.TrimSpace(parts[0])
+	b := strings.TrimSpace(parts[1])
+
+	// suffix-byte-range-spec: "-<suffix>"
+	if a == "" {
+		if b == "" {
+			return 0, 0, false
+		}
+		suf, err := strconv.ParseInt(b, 10, 64)
+		if err != nil || suf <= 0 {
+			return 0, 0, false
+		}
+		if suf > size {
+			suf = size
+		}
+		return size - suf, size - 1, true
+	}
+
+	// "<start>-<end>" or "<start>-"
+	s, err := strconv.ParseInt(a, 10, 64)
+	if err != nil || s < 0 {
+		return 0, 0, false
+	}
+	if s >= size {
+		return 0, 0, false
+	}
+	if b == "" {
+		return s, size - 1, true
+	}
+	e, err := strconv.ParseInt(b, 10, 64)
+	if err != nil || e < 0 {
+		return 0, 0, false
+	}
+	if e < s {
+		return 0, 0, false
+	}
+	if e >= size {
+		e = size - 1
+	}
+	return s, e, true
+}
+
+func (h *Handler) maybeFillFullInBackground(r *http.Request) {
+	// Only for GET (HEAD doesn't need body).
+	if r.Method != http.MethodGet {
+		return
+	}
+
+	path := r.URL.Path
+	key := cache.KeyForPath(path)
+	unlock, ok := h.locks.TryLock(key)
+	if !ok {
+		return
+	}
+
+	// If we got the lock, do the full fetch in a goroutine to not block this request.
+	go func() {
+		defer unlock()
+
+		// If another request filled it while we were queued to run, avoid extra origin hit.
+		_, _, fresh, err := h.cacheDisk.LoadFresh(path, time.Now())
+		if err == nil && fresh {
+			return
+		}
+
+		h.fetchFullToCache(r, path)
+	}()
+}
+
+func (h *Handler) fetchFullToCache(src *http.Request, path string) {
+	upstreamURL := h.upstreamURL(src.URL)
+
+	// Detach from the client request: this fill should continue even if the client disconnects.
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL.String(), nil)
+	if err != nil {
+		return
+	}
+
+	// Copy client headers, but ensure no Range and stable cached variants.
+	req.Header = cloneHeader(src.Header)
+	req.Header.Del("Range")
+	removeHopByHopRequestHeaders(req.Header)
+	req.Header.Set("Accept-Encoding", "identity")
+
+	// Preserve Host behavior.
+	if h.cfg.UseOriginHost {
+		req.Host = h.origin.Host
+	} else {
+		req.Host = src.Host
+	}
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return
+	}
+
+	now := time.Now()
+	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(path)
+	if err != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return
+	}
+
+	f, err := os.Create(tmpBody)
+	if err != nil {
+		_ = os.Remove(tmpMeta)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return
+	}
+
+	n, err := io.Copy(f, resp.Body)
+	_ = f.Close()
+	if err != nil {
+		_ = os.Remove(tmpBody)
+		_ = os.Remove(tmpMeta)
+		return
+	}
+
+	if err := os.Rename(tmpBody, bodyFinal); err != nil {
+		_ = os.Remove(tmpBody)
+		_ = os.Remove(tmpMeta)
+		return
+	}
+
+	storedHeader := filterHopByHopResponseHeaders(resp.Header)
+	storedHeader.Set("Content-Length", strconv.FormatInt(n, 10))
+
+	meta := &cache.Meta{
+		Path:      path,
+		Status:    resp.StatusCode,
+		Header:    storedHeader,
+		CreatedAt: now,
+		ExpiresAt: now.Add(h.cacheDisk.TTL),
+		Size:      n,
+	}
+
+	if err := h.cacheDisk.WriteMeta(tmpMeta, metaFinal, meta); err != nil {
+		_ = os.Remove(metaFinal)
+		_ = os.Remove(bodyFinal)
+		return
+	}
+
+	if h.recache != nil {
+		h.recache.Update(path, meta.ExpiresAt)
+	}
 }
 
 func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time) {

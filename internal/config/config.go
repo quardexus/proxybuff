@@ -49,7 +49,7 @@ func Default() Config {
 		Cache:          nil,
 		Recache:        nil,
 		RecacheAhead:   5 * time.Minute,
-		RecacheWorkers: 2,
+		RecacheWorkers: 4,
 	}
 }
 

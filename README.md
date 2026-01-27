@@ -2,7 +2,7 @@
 
 High-load HTTP reverse proxy with disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew).
 
-Developed by **Quardexus**. Version **v1.2.0**.
+Developed by **Quardexus**. Version **v1.3.0**.
 
 ## What it does
 
@@ -16,16 +16,24 @@ Developed by **Quardexus**. Version **v1.2.0**.
 - **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
 - **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
 
-## Caching rules (v1.2.0)
+## Caching rules (v1.3.0)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.
-- **Range requests** (`Range:` header): never cached (proxied directly).
+- **Range requests** (`Range:` header):
+  - If the full file is already cached, ProxyBuff serves a **single byte range** (`206`) from disk.
+  - Otherwise, ProxyBuff proxies the range request and downloads the full file in the background to populate cache for next time.
+  - **Multi-range** requests (e.g. `bytes=0-99,200-299`) are **not supported** for cache serving and are proxied.
 - **Cache key**: **path only** (`/some/file.png`). Query string is **ignored for the cache key**, but is still forwarded to the origin.
 - **Response headers**:
   - On HIT, headers come from cached metadata and are sent “as stored”.
   - ProxyBuff always adds `X-ProxyBuff-Cache: HIT|MISS`.
   - `Age` header is **optional** (enabled via `--age-header`) and is computed from the cached entry creation time.
+
+- **Cache cleanup (GC)**:
+  - ProxyBuff runs a best-effort garbage collector about **once per TTL** that removes expired cached entries from disk even without client traffic.
+  - It scans `meta.json` files and deletes the corresponding `meta.json` and `body` when `ExpiresAt` is in the past.
+  - GC stops on shutdown (it is tied to the app's background context).
 
 ## Cache patterns
 
@@ -55,7 +63,7 @@ How it works:
 Defaults:
 
 - `--recache-ahead=5m`
-- `--recache-workers=2`
+- `--recache-workers=4`
 
 ## Install / build locally
 
@@ -175,7 +183,7 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 - `--cache` (repeatable, default empty): cache patterns
 - `--recache` (repeatable, default empty): auto-refresh patterns (also implies caching those patterns)
 - `--recache-ahead` (default `5m`): how long before expiry to refresh an entry
-- `--recache-workers` (default `2`): max concurrent background refresh workers
+- `--recache-workers` (default `4`): max concurrent background refresh workers
 - `--ttl` (default `10m`): cache TTL duration
 - `--cache-dir` (default `./cache`): cache directory (in Docker defaults to `/var/lib/proxybuff/cache`)
 - `--log-file` (default empty): optional log file path (also logs to stdout)

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -101,6 +103,54 @@ func (d Disk) WriteMeta(tmpMeta, metaFinal string, m *Meta) error {
 		return fmt.Errorf("rename meta: %w", err)
 	}
 	return nil
+}
+
+// SweepExpired walks cache dir and removes expired entries (meta.json + body).
+// This is a best-effort operation: it continues on individual errors.
+func (d Disk) SweepExpired(now time.Time) (deleted int, err error) {
+	root := strings.TrimSpace(d.Dir)
+	if root == "" {
+		return 0, errors.New("cache dir is required")
+	}
+	// If cache dir doesn't exist, nothing to do.
+	if _, statErr := os.Stat(root); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, statErr
+	}
+
+	walkErr := filepath.WalkDir(root, func(p string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// skip this subtree entry
+			return nil
+		}
+		if de.IsDir() {
+			return nil
+		}
+		if de.Name() != "meta.json" {
+			return nil
+		}
+
+		meta, readErr := readMeta(p)
+		if readErr != nil {
+			return nil
+		}
+		if !now.After(meta.ExpiresAt) {
+			return nil
+		}
+
+		dir := filepath.Dir(p)
+		bodyPath := filepath.Join(dir, "body")
+		_ = os.Remove(p)
+		_ = os.Remove(bodyPath)
+		deleted++
+		return nil
+	})
+	if walkErr != nil {
+		return deleted, walkErr
+	}
+	return deleted, nil
 }
 
 func readMeta(metaPath string) (*Meta, error) {

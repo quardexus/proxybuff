@@ -16,7 +16,7 @@ Developed by **Quardexus**. Version **v1.3.0**.
 - **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
 - **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
 
-## Caching rules (v1.3.0)
+## Caching rules (v1.3.1)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.

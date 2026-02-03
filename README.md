@@ -2,7 +2,7 @@
 
 High-load HTTP reverse proxy with disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew).
 
-Developed by **Quardexus**. Version **v1.3.0**.
+Developed by **Quardexus**. Version **v1.3.2**.
 
 ## What it does
 
@@ -16,7 +16,7 @@ Developed by **Quardexus**. Version **v1.3.0**.
 - **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
 - **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
 
-## Caching rules (v1.3.1)
+## Caching rules (v1.3.2)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.
@@ -83,7 +83,7 @@ go build -o proxybuff ./cmd/proxybuff
   --cache "*.png" \
   --recache "/assets/*" \
   --recache-ahead 5m \
-  --recache-workers 2 \
+  --recache-workers 4 \
   --cache-dir ./cache
 ```
 
@@ -168,6 +168,21 @@ Optionally specify a directory:
 
 ```bash
 docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/cache
+```
+
+## Status Command
+
+You can view the current cache status (cached files, size, expiration) without running the server:
+
+```bash
+# From binary (looks in ./cache by default)
+./proxybuff status
+
+# Specify cache directory
+./proxybuff status --cache-dir /var/lib/proxybuff/cache
+
+# Or use config file
+./proxybuff status --config ./config.json
 ```
 
 ## Flags

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,17 +14,24 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/quardexus/proxybuff/internal/cache"
 	"github.com/quardexus/proxybuff/internal/config"
 	"github.com/quardexus/proxybuff/internal/proxy"
 	"github.com/quardexus/proxybuff/internal/version"
-
-	"golang.org/x/crypto/acme/autocert"
 )
 
 func main() {
 	args := os.Args[1:]
+
+	if len(args) > 0 && args[0] == "status" {
+		runStatus(args[1:])
+		return
+	}
 
 	var writeEffectiveConfigPath string
 	args = stripWriteEffectiveConfig(args, &writeEffectiveConfigPath)
@@ -79,7 +87,11 @@ func printUsage() {
 Usage:
   proxybuff --origin <url> [--http[=<port|addr>]] [--https[=<port|addr>]] [--cache <pattern>] [--ttl 10m] [--cache-dir ./cache] [--age-header]
   proxybuff --config /path/to/config.json
+  proxybuff status [--cache-dir ./cache] [--config /path/to/config.json]
   proxybuff --version
+
+Commands:
+  status        Show cache statistics and list cached files
 
 Flags:
   --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme.
@@ -90,7 +102,7 @@ Flags:
   --cache       Cache path pattern (repeatable). '*' matches any chars including '/'. '/' caches only root path.
   --recache     Auto-refresh cached path pattern (repeatable). When an entry is close to expiry, ProxyBuff refreshes it in the background.
   --recache-ahead    How long before expiry to trigger refresh (default 5m)
-  --recache-workers  Max concurrent background refresh workers (default 2)
+  --recache-workers  Max concurrent background refresh workers (default 4)
   --ttl         Cache TTL duration (default 10m)
   --cache-dir   Cache directory path (default ./cache)
   --log-file    Optional log file path (also logs to stdout)
@@ -324,4 +336,126 @@ func isPort(addr, port string) bool {
 		return strings.TrimPrefix(addr, ":") == port
 	}
 	return false
+}
+
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("proxybuff status", flag.ExitOnError)
+	cacheDir := fs.String("cache-dir", "./cache", "cache directory path")
+	configPath := fs.String("config", "", "path to JSON config file (optional, to read cache-dir)")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	var cfg statusConfig
+	if *configPath != "" {
+		var err error
+		cfg, err = readStatusConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "status: read config: %v\n", err)
+			os.Exit(2)
+		}
+
+		isExplicit := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "cache-dir" {
+				isExplicit = true
+			}
+		})
+		if !isExplicit && strings.TrimSpace(cfg.CacheDir) != "" {
+			*cacheDir = cfg.CacheDir
+		}
+	}
+
+	cd := cache.Disk{Dir: *cacheDir, TTL: 1} // TTL doesn't matter for walking
+
+	var recacheMatchers []cache.Matcher
+	if len(cfg.Recache) > 0 {
+		recacheMatchers, _ = cache.CompileMatchers(cfg.Recache)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "PATH\tSIZE\tCREATED\tEXPIRES\tTTL_LEFT\tRECACHE\tCACHE_FILE")
+
+	count := 0
+	totalSize := int64(0)
+	now := time.Now()
+
+	err := cd.Walk(func(meta cache.Meta, bodyPath string) error {
+		count++
+		totalSize += meta.Size
+
+		isRecache := ""
+		if len(recacheMatchers) > 0 {
+			for _, m := range recacheMatchers {
+				if m.Match(meta.Path) {
+					isRecache = "YES"
+					break
+				}
+			}
+		}
+
+		// Calculate TTL remaining
+		ttl := meta.ExpiresAt.Sub(now).Round(time.Second)
+		if ttl < 0 {
+			ttl = 0
+		}
+
+		created := meta.CreatedAt.Format(time.RFC3339)
+		expires := meta.ExpiresAt.Format(time.RFC3339)
+		cacheFile := bodyPath
+		if rel, err := filepath.Rel(cd.Dir, bodyPath); err == nil {
+			cacheFile = rel
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			meta.Path,
+			byteCountIEC(meta.Size),
+			created,
+			expires,
+			ttl,
+			isRecache,
+			cacheFile,
+		)
+		return nil
+	})
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error walking cache: %v\n", err)
+		os.Exit(1)
+	}
+
+	w.Flush()
+	fmt.Printf("\nTotal: %d files, %s\n", count, byteCountIEC(totalSize))
+}
+
+func byteCountIEC(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+type statusConfig struct {
+	CacheDir string   `json:"cacheDir"`
+	Recache  []string `json:"recache"`
+}
+
+func readStatusConfig(path string) (statusConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return statusConfig{}, err
+	}
+	var cfg statusConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return statusConfig{}, err
+	}
+	cfg.CacheDir = strings.TrimSpace(cfg.CacheDir)
+	return cfg, nil
 }

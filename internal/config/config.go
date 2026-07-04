@@ -1,3 +1,9 @@
+// ════════════════════════════════════════════════════════════
+//   QUARDEXUS · functional entity
+// ════════════════════════════════════════════════════════════
+// ProxyBuff · high-load caching reverse proxy with auto-TLS
+// SPDX-License-Identifier: Apache-2.0 · © 2026 Quardexus
+
 package config
 
 import (
@@ -7,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -37,7 +44,32 @@ type Config struct {
 	UseOriginHost      bool          `json:"useOriginHost"`
 	InsecureSkipVerify bool          `json:"insecureSkipVerify"`
 
+	// CacheVaryHost includes the request Host in the cache key (on by default).
+	CacheVaryHost bool `json:"cacheVaryHost"`
+	// CacheKeyQuery includes the query string in the cache key (on by default).
+	CacheKeyQuery bool `json:"cacheKeyQuery"`
+
+	// Hosts, when non-empty, enables multi-host routing. Each entry serves its
+	// matching domains from its own origin/cache settings; omitted fields are
+	// inherited from the top-level defaults above. When empty, ProxyBuff behaves
+	// exactly as a single-origin proxy (backward compatible).
+	Hosts []HostConfig `json:"hosts,omitempty"`
+
 	LogFile string `json:"logFile"`
+}
+
+// HostConfig is a fully-resolved per-host routing target. It is produced by
+// merging a config-file "hosts[]" entry with the top-level defaults.
+type HostConfig struct {
+	Match              []string
+	Origin             string
+	Cache              []string
+	Recache            []string
+	TTL                time.Duration
+	TLSDomains         []string
+	UseOriginHost      bool
+	InsecureSkipVerify bool
+	AgeHeader          bool
 }
 
 func Default() Config {
@@ -50,12 +82,29 @@ func Default() Config {
 		Recache:        nil,
 		RecacheAhead:   5 * time.Minute,
 		RecacheWorkers: 4,
+		CacheVaryHost:  true,
+		CacheKeyQuery:  true,
 	}
 }
 
 func (c *Config) Validate() error {
-	if strings.TrimSpace(c.Origin) == "" {
-		return errors.New("origin is required")
+	if len(c.Hosts) == 0 {
+		if strings.TrimSpace(c.Origin) == "" {
+			return errors.New("origin is required")
+		}
+	} else {
+		for i := range c.Hosts {
+			h := &c.Hosts[i]
+			if len(h.Match) == 0 {
+				return fmt.Errorf("hosts[%d]: match is required (at least one domain)", i)
+			}
+			if strings.TrimSpace(h.Origin) == "" {
+				return fmt.Errorf("hosts[%d] (%s): origin is required (set it on the host or provide a top-level origin to inherit)", i, h.Match[0])
+			}
+			if h.TTL <= 0 {
+				return fmt.Errorf("hosts[%d] (%s): ttl must be > 0", i, h.Match[0])
+			}
+		}
 	}
 	if !c.HTTPEnabled {
 		return errors.New("http listener cannot be disabled")
@@ -66,8 +115,8 @@ func (c *Config) Validate() error {
 	if c.HTTPSEnabled && strings.TrimSpace(c.HttpsListen) == "" {
 		return errors.New("httpsListen is required when https is enabled")
 	}
-	if c.HTTPSEnabled && len(c.TLSDomains) == 0 {
-		return errors.New("tlsDomains is required when https is enabled (use --tls-domain)")
+	if c.HTTPSEnabled && c.totalTLSDomains() == 0 {
+		return errors.New("tlsDomains is required when https is enabled (use --tls-domain or set tlsDomains per host)")
 	}
 	if strings.TrimSpace(c.CacheDir) == "" {
 		return errors.New("cacheDir is required")
@@ -82,6 +131,14 @@ func (c *Config) Validate() error {
 		return errors.New("recacheWorkers must be >= 0")
 	}
 	return nil
+}
+
+func (c *Config) totalTLSDomains() int {
+	n := len(c.TLSDomains)
+	for i := range c.Hosts {
+		n += len(c.Hosts[i].TLSDomains)
+	}
+	return n
 }
 
 // Parse reads configuration from flags, optionally from a JSON config file.
@@ -110,6 +167,8 @@ func Parse(args []string) (Config, error) {
 		ageHeader      bool
 		useOriginHost  bool
 		insecureTLS    boolFlag
+		cacheVaryHost  bool
+		cacheKeyQuery  bool
 		cacheMulti     multiString
 		recacheMulti   multiString
 		tlsDomainMulti multiString
@@ -134,11 +193,13 @@ func Parse(args []string) (Config, error) {
 	fs.DurationVar(&ttl, "ttl", cfg.TTL, "cache TTL duration, e.g. 10m, 1h")
 	fs.Var(&recacheMulti, "recache", "auto-refresh cached path patterns (repeatable). When an entry is close to expiry, ProxyBuff refreshes it in the background.")
 	fs.DurationVar(&recacheAhead, "recache-ahead", cfg.RecacheAhead, "how long before expiry to trigger background refresh (default 5m)")
-	fs.IntVar(&recacheWorkers, "recache-workers", cfg.RecacheWorkers, "max concurrent background refresh workers (default 2)")
+	fs.IntVar(&recacheWorkers, "recache-workers", cfg.RecacheWorkers, "max concurrent background refresh workers (default 4)")
 	fs.BoolVar(&ageHeader, "age-header", false, "add standard Age header on cache HIT")
 	fs.BoolVar(&useOriginHost, "use-origin-host", false, "send Host header from --origin (default: forward the original client Host)")
 	fs.Var(&insecureTLS, "insecure-skip-verify", "skip TLS certificate verification for https origins (dangerous)")
 	fs.Var(&cacheMulti, "cache", "cache path patterns (repeatable). '*' matches any chars including '/'. '/' caches only root path.")
+	fs.BoolVar(&cacheVaryHost, "cache-vary-host", cfg.CacheVaryHost, "include the request Host in the cache key (default true; disable with --cache-vary-host=false)")
+	fs.BoolVar(&cacheKeyQuery, "cache-key-query", cfg.CacheKeyQuery, "include the query string in the cache key (default true; disable with --cache-key-query=false)")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -207,6 +268,12 @@ func Parse(args []string) (Config, error) {
 	}
 	if visited["cache"] {
 		cfg.Cache = normalizeCachePatterns(cacheMulti.items)
+	}
+	if visited["cache-vary-host"] {
+		cfg.CacheVaryHost = cacheVaryHost
+	}
+	if visited["cache-key-query"] {
+		cfg.CacheKeyQuery = cacheKeyQuery
 	}
 
 	// Ensure recache patterns are also cached.
@@ -283,23 +350,26 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		return Config{}, fileExplicit{}, fmt.Errorf("read config: %w", err)
 	}
 	var raw struct {
-		Listen             *string  `json:"listen"`
-		HTTPEnabled        *bool    `json:"httpEnabled"`
-		HttpListen         *string  `json:"httpListen"`
-		HTTPSEnabled       *bool    `json:"httpsEnabled"`
-		HttpsListen        *string  `json:"httpsListen"`
-		TLSDomains         []string `json:"tlsDomains"`
-		Origin             *string  `json:"origin"`
-		CacheDir           *string  `json:"cacheDir"`
-		LogFile            *string  `json:"logFile"`
-		TTL                *string  `json:"ttl"`
-		Cache              []string `json:"cache"`
-		Recache            []string `json:"recache"`
-		RecacheAhead       *string  `json:"recacheAhead"`
-		RecacheWorkers     *int     `json:"recacheWorkers"`
-		AgeHeader          *bool    `json:"ageHeader"`
-		UseOriginHost      *bool    `json:"useOriginHost"`
-		InsecureSkipVerify *bool    `json:"insecureSkipVerify"`
+		Listen             *string   `json:"listen"`
+		HTTPEnabled        *bool     `json:"httpEnabled"`
+		HttpListen         *string   `json:"httpListen"`
+		HTTPSEnabled       *bool     `json:"httpsEnabled"`
+		HttpsListen        *string   `json:"httpsListen"`
+		TLSDomains         []string  `json:"tlsDomains"`
+		Origin             *string   `json:"origin"`
+		CacheDir           *string   `json:"cacheDir"`
+		LogFile            *string   `json:"logFile"`
+		TTL                *string   `json:"ttl"`
+		Cache              []string  `json:"cache"`
+		Recache            []string  `json:"recache"`
+		RecacheAhead       *string   `json:"recacheAhead"`
+		RecacheWorkers     *int      `json:"recacheWorkers"`
+		AgeHeader          *bool     `json:"ageHeader"`
+		UseOriginHost      *bool     `json:"useOriginHost"`
+		InsecureSkipVerify *bool     `json:"insecureSkipVerify"`
+		CacheVaryHost      *bool     `json:"cacheVaryHost"`
+		CacheKeyQuery      *bool     `json:"cacheKeyQuery"`
+		Hosts              []rawHost `json:"hosts"`
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -365,6 +435,12 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	if raw.UseOriginHost != nil {
 		cfg.UseOriginHost = *raw.UseOriginHost
 	}
+	if raw.CacheVaryHost != nil {
+		cfg.CacheVaryHost = *raw.CacheVaryHost
+	}
+	if raw.CacheKeyQuery != nil {
+		cfg.CacheKeyQuery = *raw.CacheKeyQuery
+	}
 	exp := fileExplicit{}
 	if raw.InsecureSkipVerify != nil {
 		cfg.InsecureSkipVerify = *raw.InsecureSkipVerify
@@ -380,7 +456,101 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		cfg.HttpListen = cfg.Listen
 		cfg.HTTPEnabled = true
 	}
+
+	// Resolve multi-host entries, inheriting from the (already-normalized) top-level defaults.
+	for _, rh := range raw.Hosts {
+		hc, err := resolveHost(rh, cfg)
+		if err != nil {
+			return Config{}, fileExplicit{}, err
+		}
+		cfg.Hosts = append(cfg.Hosts, hc)
+	}
+
 	return cfg, exp, nil
+}
+
+// rawHost is the on-disk shape of a "hosts[]" entry. Pointer/slice fields
+// distinguish "not set" (inherit the top-level default) from an explicit value.
+type rawHost struct {
+	Match              []string `json:"match"`
+	Origin             *string  `json:"origin"`
+	Cache              []string `json:"cache"`
+	Recache            []string `json:"recache"`
+	TTL                *string  `json:"ttl"`
+	TLSDomains         []string `json:"tlsDomains"`
+	UseOriginHost      *bool    `json:"useOriginHost"`
+	InsecureSkipVerify *bool    `json:"insecureSkipVerify"`
+	AgeHeader          *bool    `json:"ageHeader"`
+}
+
+// resolveHost merges a raw host entry with the top-level defaults into a fully
+// resolved HostConfig.
+func resolveHost(rh rawHost, base Config) (HostConfig, error) {
+	hc := HostConfig{
+		Match:              normalizeCachePatterns(rh.Match),
+		Cache:              normalizeCachePatterns(rh.Cache),
+		Recache:            normalizeCachePatterns(rh.Recache),
+		TLSDomains:         normalizeCachePatterns(rh.TLSDomains),
+		TTL:                base.TTL,
+		UseOriginHost:      base.UseOriginHost,
+		AgeHeader:          base.AgeHeader,
+		InsecureSkipVerify: base.InsecureSkipVerify,
+	}
+
+	if rh.Origin != nil && strings.TrimSpace(*rh.Origin) != "" {
+		norm, tlsIP := normalizeOrigin(*rh.Origin)
+		hc.Origin = norm
+		if rh.InsecureSkipVerify == nil && tlsIP {
+			hc.InsecureSkipVerify = true
+		}
+	} else {
+		// Inherit the top-level origin (already normalized).
+		hc.Origin = base.Origin
+	}
+
+	if rh.TTL != nil {
+		d, err := time.ParseDuration(*rh.TTL)
+		if err != nil {
+			return HostConfig{}, fmt.Errorf("parse host ttl: %w", err)
+		}
+		hc.TTL = d
+	}
+	if rh.UseOriginHost != nil {
+		hc.UseOriginHost = *rh.UseOriginHost
+	}
+	if rh.AgeHeader != nil {
+		hc.AgeHeader = *rh.AgeHeader
+	}
+	if rh.InsecureSkipVerify != nil {
+		hc.InsecureSkipVerify = *rh.InsecureSkipVerify
+	}
+
+	// Inherit caching rules from the top-level when the host omits them.
+	if len(hc.Cache) == 0 {
+		hc.Cache = base.Cache
+	}
+	if len(hc.Recache) == 0 {
+		hc.Recache = base.Recache
+	}
+	hc.Cache = mergeUnique(hc.Cache, hc.Recache)
+
+	// Default the host's TLS domains to its concrete (non-wildcard) match entries.
+	if len(hc.TLSDomains) == 0 {
+		hc.TLSDomains = exactMatchHosts(hc.Match)
+	}
+
+	return hc, nil
+}
+
+// exactMatchHosts returns the non-wildcard entries of a match list.
+func exactMatchHosts(match []string) []string {
+	var out []string
+	for _, m := range match {
+		if !strings.HasPrefix(m, "*.") {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // normalizeOriginAndTLSDefaults allows passing host[:port][/basepath] without a scheme.
@@ -391,67 +561,58 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 //
 // - If scheme is omitted and host is not an IP, default scheme becomes http.
 func normalizeOriginAndTLSDefaults(cfg *Config, insecureSkipVerifyExplicit bool) {
-	origin := strings.TrimSpace(cfg.Origin)
-	cfg.Origin = origin
-	if origin == "" {
-		return
+	normalized, tlsIP := normalizeOrigin(cfg.Origin)
+	cfg.Origin = normalized
+	if tlsIP && !insecureSkipVerifyExplicit {
+		cfg.InsecureSkipVerify = true
+		log.Printf("proxybuff: WARNING: origin %s uses TLS on a raw IP; certificate verification is disabled (pass --insecure-skip-verify=false to override)", normalized)
 	}
-	if strings.Contains(origin, "://") {
-		return
-	}
+}
 
+// normalizeOrigin adds a scheme to a scheme-less origin. For a raw IP that
+// answers a TLS handshake it returns https and tlsIP=true (so the caller may
+// default InsecureSkipVerify on); otherwise it returns http. An origin that
+// already has a scheme is returned unchanged.
+func normalizeOrigin(origin string) (normalized string, tlsIP bool) {
+	origin = strings.TrimSpace(origin)
+	if origin == "" || strings.Contains(origin, "://") {
+		return origin, false
+	}
+	host, port := hostPortFromOrigin(origin)
+	if net.ParseIP(host) != nil {
+		if probeTLS(host, port) {
+			return "https://" + origin, true
+		}
+		return "http://" + origin, false
+	}
+	return "http://" + origin, false
+}
+
+// hostPortFromOrigin extracts host and port from a scheme-less "host[:port][/path]"
+// origin, defaulting the port to 80 when absent.
+func hostPortFromOrigin(origin string) (host, port string) {
 	hostport := origin
 	if i := strings.Index(hostport, "/"); i >= 0 {
 		hostport = hostport[:i]
 	}
-	host := hostport
-	port := ""
-	// Strip port for IPv4/hostname.
-	if strings.HasPrefix(host, "[") {
-		if j := strings.Index(host, "]"); j > 1 {
-			host = host[1:j]
-		}
-	} else if strings.Count(host, ":") == 1 {
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		} else {
-			// net.SplitHostPort requires port; fallback
-			host = strings.SplitN(host, ":", 2)[0]
-		}
-	}
-	// Extract port if explicitly present.
 	if strings.HasPrefix(hostport, "[") {
 		if h, p, err := net.SplitHostPort(hostport); err == nil {
-			host = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
-			port = p
+			return strings.TrimPrefix(strings.TrimSuffix(h, "]"), "["), p
 		}
-	} else if strings.Count(hostport, ":") == 1 {
-		if _, p, err := net.SplitHostPort(hostport); err == nil {
-			port = p
-		} else {
-			// fallback
-			if parts := strings.SplitN(hostport, ":", 2); len(parts) == 2 {
-				port = parts[1]
-			}
+		if j := strings.Index(hostport, "]"); j > 1 {
+			return hostport[1:j], "80"
+		}
+		return hostport, "80"
+	}
+	if strings.Count(hostport, ":") == 1 {
+		if h, p, err := net.SplitHostPort(hostport); err == nil {
+			return h, p
+		}
+		if parts := strings.SplitN(hostport, ":", 2); len(parts) == 2 {
+			return parts[0], parts[1]
 		}
 	}
-	if port == "" {
-		port = "80"
-	}
-
-	if net.ParseIP(host) != nil {
-		if probeTLS(host, port) {
-			cfg.Origin = "https://" + origin
-			if !insecureSkipVerifyExplicit {
-				cfg.InsecureSkipVerify = true
-			}
-		} else {
-			cfg.Origin = "http://" + origin
-		}
-		return
-	}
-
-	cfg.Origin = "http://" + origin
+	return hostport, "80"
 }
 
 func probeTLS(host, port string) bool {

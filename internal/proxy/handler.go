@@ -1,3 +1,9 @@
+// ════════════════════════════════════════════════════════════
+//   QUARDEXUS · functional entity
+// ════════════════════════════════════════════════════════════
+// ProxyBuff · high-load caching reverse proxy with auto-TLS
+// SPDX-License-Identifier: Apache-2.0 · © 2026 Quardexus
+
 package proxy
 
 import (
@@ -20,43 +26,59 @@ import (
 	"github.com/quardexus/proxybuff/internal/config"
 )
 
-type Handler struct {
-	cfg       config.Config
-	origin    *url.URL
-	cacheDisk cache.Disk
-	matchers  []cache.Matcher
-	recache   *recacheScheduler
-	locks     *keyedLocker
-
-	client *http.Client
-	proxy  *httputil.ReverseProxy
+// site is a single routing target: a set of matching hostnames with their own
+// origin, cache rules and TLS domains. In single-host mode there is exactly one
+// site (with an empty id and no host patterns) that handles every request.
+type site struct {
+	id            string
+	hostMatch     []hostPattern
+	tlsDomains    []hostPattern
+	origin        *url.URL
+	client        *http.Client
+	proxy         *httputil.ReverseProxy
+	matchers      []cache.Matcher
+	ttl           time.Duration
+	ageHeader     bool
+	useOriginHost bool
+	recache       *recacheScheduler
 }
 
-func New(cfg config.Config) (*Handler, error) {
-	u, err := url.Parse(cfg.Origin)
-	if err != nil {
-		return nil, fmt.Errorf("parse origin: %w", err)
+func (s *site) shouldCache(path string) bool {
+	for _, m := range s.matchers {
+		if m.Match(path) {
+			return true
+		}
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("origin must be a full URL with scheme and host, got %q", cfg.Origin)
-	}
+	return false
+}
 
-	matchers, err := cache.CompileMatchers(cfg.Cache)
-	if err != nil {
-		return nil, err
-	}
+func (s *site) upstreamURL(in *url.URL) *url.URL {
+	u := *s.origin
+	u.Path = singleJoiningSlash(s.origin.Path, in.Path)
+	u.RawQuery = in.RawQuery
+	u.Fragment = ""
+	return &u
+}
 
-	recacheMatchers, err := cache.CompileMatchers(cfg.Recache)
-	if err != nil {
-		return nil, err
-	}
+type Handler struct {
+	cfg         config.Config
+	sites       []*site
+	defaultSite *site
+	cacheDisk   cache.Disk
+	locks       *keyedLocker
 
-	cd := cache.Disk{Dir: cfg.CacheDir, TTL: cfg.TTL}
-	if err := cd.Validate(); err != nil {
-		return nil, err
-	}
+	// bgSem bounds the number of concurrent background full-file downloads
+	// triggered by Range misses, to avoid amplification.
+	bgSem chan struct{}
+}
 
-	transport := &http.Transport{
+const (
+	maxBackgroundFills     = 16
+	backgroundFetchTimeout = 10 * time.Minute
+)
+
+func newTransport(insecureSkipVerify bool) *http.Transport {
+	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -66,48 +88,220 @@ func New(cfg config.Config) (*Handler, error) {
 		MaxIdleConns:          1024,
 		MaxIdleConnsPerHost:   256,
 		IdleConnTimeout:       90 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkipVerify},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
+}
 
-	rp := httputil.NewSingleHostReverseProxy(u)
-	rp.Transport = transport
-	origDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		// Save original host before the default director overwrites it.
-		originalHost := req.Host
-		origDirector(req)
-		if !cfg.UseOriginHost {
-			req.Host = originalHost
-		}
+func New(cfg config.Config) (*Handler, error) {
+	cd := cache.Disk{Dir: cfg.CacheDir, TTL: cfg.TTL}
+	if err := cd.Validate(); err != nil {
+		return nil, err
 	}
-	// keep the default error handler behavior (502), but do not log secrets.
 
 	h := &Handler{
 		cfg:       cfg,
-		origin:    u,
 		cacheDisk: cd,
-		matchers:  matchers,
 		locks:     newKeyedLocker(),
-		client:    &http.Client{Transport: transport},
-		proxy:     rp,
+		bgSem:     make(chan struct{}, maxBackgroundFills),
 	}
 
-	if len(recacheMatchers) > 0 && cfg.RecacheWorkers > 0 {
-		h.recache = newRecacheScheduler(cd, u, h.client, h.locks, recacheMatchers, cfg.RecacheAhead, cfg.RecacheWorkers)
+	if len(cfg.Hosts) == 0 {
+		// Single-host mode (backward compatible): one default site handles all.
+		s, err := h.buildSite(siteSpec{
+			id:            "",
+			origin:        cfg.Origin,
+			cache:         cfg.Cache,
+			recache:       cfg.Recache,
+			ttl:           cfg.TTL,
+			useOriginHost: cfg.UseOriginHost,
+			ageHeader:     cfg.AgeHeader,
+			insecure:      cfg.InsecureSkipVerify,
+			tlsDomains:    cfg.TLSDomains,
+		})
+		if err != nil {
+			return nil, err
+		}
+		h.sites = []*site{s}
+		h.defaultSite = s
+		return h, nil
+	}
+
+	for _, hc := range cfg.Hosts {
+		id := hc.Match[0]
+		s, err := h.buildSite(siteSpec{
+			id:            id,
+			match:         hc.Match,
+			origin:        hc.Origin,
+			cache:         hc.Cache,
+			recache:       hc.Recache,
+			ttl:           hc.TTL,
+			useOriginHost: hc.UseOriginHost,
+			ageHeader:     hc.AgeHeader,
+			insecure:      hc.InsecureSkipVerify,
+			tlsDomains:    hc.TLSDomains,
+		})
+		if err != nil {
+			return nil, err
+		}
+		h.sites = append(h.sites, s)
+	}
+
+	// Optional fallback site (from top-level origin) for unmatched Host headers.
+	if strings.TrimSpace(cfg.Origin) != "" {
+		s, err := h.buildSite(siteSpec{
+			id:            "",
+			origin:        cfg.Origin,
+			cache:         cfg.Cache,
+			recache:       cfg.Recache,
+			ttl:           cfg.TTL,
+			useOriginHost: cfg.UseOriginHost,
+			ageHeader:     cfg.AgeHeader,
+			insecure:      cfg.InsecureSkipVerify,
+			tlsDomains:    cfg.TLSDomains,
+		})
+		if err != nil {
+			return nil, err
+		}
+		h.sites = append(h.sites, s)
+		h.defaultSite = s
 	}
 
 	return h, nil
 }
 
-// StartBackground launches background components (like recache scheduler).
-// It is safe to call multiple times.
+type siteSpec struct {
+	id            string
+	match         []string
+	origin        string
+	cache         []string
+	recache       []string
+	ttl           time.Duration
+	useOriginHost bool
+	ageHeader     bool
+	insecure      bool
+	tlsDomains    []string
+}
+
+func (h *Handler) buildSite(spec siteSpec) (*site, error) {
+	u, err := url.Parse(spec.origin)
+	if err != nil {
+		return nil, fmt.Errorf("parse origin %q: %w", spec.origin, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("origin must be a full URL with scheme and host, got %q", spec.origin)
+	}
+
+	matchers, err := cache.CompileMatchers(spec.cache)
+	if err != nil {
+		return nil, err
+	}
+	recacheMatchers, err := cache.CompileMatchers(spec.recache)
+	if err != nil {
+		return nil, err
+	}
+
+	transport := newTransport(spec.insecure)
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.Transport = transport
+	useOriginHost := spec.useOriginHost
+	origDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		// Save original host before the default director overwrites it.
+		originalHost := req.Host
+		origDirector(req)
+		if !useOriginHost {
+			req.Host = originalHost
+		}
+	}
+	client := &http.Client{Transport: transport}
+
+	s := &site{
+		id:            spec.id,
+		hostMatch:     parseHostPatterns(spec.match),
+		tlsDomains:    parseHostPatterns(spec.tlsDomains),
+		origin:        u,
+		client:        client,
+		proxy:         rp,
+		matchers:      matchers,
+		ttl:           spec.ttl,
+		ageHeader:     spec.ageHeader,
+		useOriginHost: useOriginHost,
+	}
+
+	if len(recacheMatchers) > 0 && h.cfg.RecacheWorkers > 0 {
+		s.recache = newRecacheScheduler(spec.id, h.cacheDisk, u, client, h.locks, recacheMatchers, spec.ttl, h.cfg.RecacheAhead, h.cfg.RecacheWorkers)
+	}
+	return s, nil
+}
+
+// resolveSite selects the site for a request Host, preferring exact matches
+// over wildcards and falling back to the default site (which is the only site
+// in single-host mode).
+func (h *Handler) resolveSite(hostHeader string) *site {
+	host := hostHeader
+	if strings.Contains(host, ":") {
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+
+	for _, s := range h.sites {
+		for _, hp := range s.hostMatch {
+			if !hp.wildcard && hp.exact == host {
+				return s
+			}
+		}
+	}
+	for _, s := range h.sites {
+		for _, hp := range s.hostMatch {
+			if hp.wildcard && hp.match(host) {
+				return s
+			}
+		}
+	}
+	return h.defaultSite
+}
+
+// HostPolicy is an autocert.HostPolicy that permits any hostname matching a
+// configured TLS domain (exact or wildcard) across all sites.
+func (h *Handler) HostPolicy(_ context.Context, host string) error {
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, s := range h.sites {
+		for _, hp := range s.tlsDomains {
+			if hp.match(host) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("acme: host %q is not configured for TLS", host)
+}
+
+// TLSDomains lists the configured TLS domain patterns across all sites (for logging).
+func (h *Handler) TLSDomains() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, s := range h.sites {
+		for _, hp := range s.tlsDomains {
+			if !seen[hp.raw] {
+				seen[hp.raw] = true
+				out = append(out, hp.raw)
+			}
+		}
+	}
+	return out
+}
+
+// StartBackground launches background components (recache schedulers and the
+// disk garbage collector). It is intended to be called once from main.
 func (h *Handler) StartBackground(ctx context.Context) {
-	// Start is idempotent enough for our usage (single start from main).
-	if h.recache != nil {
-		h.recache.Start(ctx)
+	for _, s := range h.sites {
+		if s.recache != nil {
+			s.recache.Start(ctx)
+		}
 	}
 
 	// Disk cache garbage collector: delete expired entries periodically.
@@ -128,67 +322,74 @@ func (h *Handler) StartBackground(ctx context.Context) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s := h.resolveSite(r.Host)
+	if s == nil {
+		http.Error(w, "no route for host", http.StatusBadGateway)
+		return
+	}
+
 	// We only cache GET/HEAD.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		h.proxy.ServeHTTP(w, r)
+		h.passThrough(s, w, r)
 		return
 	}
 
 	path := r.URL.Path
-	cacheable := h.shouldCache(path)
+	cacheable := s.shouldCache(path)
 
 	// Range support (single range): if full file is already cached, serve range from disk.
 	// Otherwise proxy the range request and (if cacheable) fill the full file in background.
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 		if cacheable {
+			key := h.cacheKey(s, r).Hash()
 			now := time.Now()
-			meta, f, ok, err := h.cacheDisk.LoadFresh(path, now)
+			meta, f, ok, err := h.cacheDisk.LoadFresh(key, now)
 			if err != nil {
 				http.Error(w, "bad gateway", http.StatusBadGateway)
 				return
 			}
 			if ok {
 				defer f.Close()
-				if h.serveSingleRangeFromCache(w, r, meta, f, now, rangeHdr) {
+				if h.serveSingleRangeFromCache(s, w, r, meta, f, now, rangeHdr) {
 					return
 				}
 			}
 
 			// Cache miss or unsupported range format: still proxy the range request,
 			// but start background full download to populate cache for next time.
-			h.maybeFillFullInBackground(r)
+			h.maybeFillFullInBackground(s, r)
 		}
 
-		h.proxy.ServeHTTP(w, r)
+		h.passThrough(s, w, r)
 		return
 	}
 
 	if !cacheable {
-		h.proxy.ServeHTTP(w, r)
+		h.passThrough(s, w, r)
 		return
 	}
 
+	k := h.cacheKey(s, r)
+	key := k.Hash()
+
 	now := time.Now()
-	meta, f, ok, err := h.cacheDisk.LoadFresh(path, now)
+	meta, f, ok, err := h.cacheDisk.LoadFresh(key, now)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	if ok {
 		defer f.Close()
-		h.serveFromCache(w, r, meta, f, now)
+		h.serveFromCache(s, w, r, meta, f, now)
 		return
 	}
 
-	// Serialize cache fills per-key.
-	key := cache.KeyForPath(path)
-
-	// Non-blocking lock: if another client is already fetching this file,
+	// Non-blocking lock: if another client is already fetching this entry,
 	// we do not wait. We simply bypass the cache for this request and
 	// stream directly from upstream to ensure low latency for everyone.
 	unlock, ok := h.locks.TryLock(key)
 	if !ok {
-		h.proxy.ServeHTTP(w, r)
+		h.passThrough(s, w, r)
 		return
 	}
 	defer unlock()
@@ -196,39 +397,84 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Re-check after acquiring lock (though with TryLock this is less likely to change,
 	// but good practice if we ever revert to blocking).
 	now = time.Now()
-	meta, f, ok, err = h.cacheDisk.LoadFresh(path, now)
+	meta, f, ok, err = h.cacheDisk.LoadFresh(key, now)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	if ok {
 		defer f.Close()
-		h.serveFromCache(w, r, meta, f, now)
+		h.serveFromCache(s, w, r, meta, f, now)
 		return
 	}
 
 	// For HEAD: we can serve from cache (above), but we don't populate cache via HEAD.
 	if r.Method == http.MethodHead {
-		h.proxy.ServeHTTP(w, r)
+		h.passThrough(s, w, r)
 		return
 	}
 
-	h.fetchAndCache(w, r)
+	h.fetchAndCache(s, w, r, k)
 }
 
-func (h *Handler) shouldCache(path string) bool {
-	if len(h.matchers) == 0 {
+// cacheKey builds the cache identity for a request based on configuration.
+// Site (host namespace) and Path are always included; Host and query are
+// included when enabled (default on).
+func (h *Handler) cacheKey(s *site, r *http.Request) cache.Key {
+	k := cache.Key{Site: s.id, Path: r.URL.Path}
+	// Varying by Host is only meaningful when we forward the client's Host upstream.
+	if h.cfg.CacheVaryHost && !s.useOriginHost {
+		k.Host = r.Host
+	}
+	if h.cfg.CacheKeyQuery {
+		k.Query = r.URL.RawQuery
+	}
+	return k
+}
+
+// passThrough proxies a request to the site origin without caching, tagging the
+// response as a cache MISS for observability.
+func (h *Handler) passThrough(s *site, w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-ProxyBuff-Cache", "MISS")
+	s.proxy.ServeHTTP(w, r)
+}
+
+// cacheableResponse reports whether a response may be stored and later shared
+// across clients. It refuses authenticated requests and responses the origin
+// marked as uncacheable or as varying on request headers we do not key on.
+func cacheableResponse(respHeader, reqHeader http.Header) bool {
+	if reqHeader.Get("Authorization") != "" {
 		return false
 	}
-	for _, m := range h.matchers {
-		if m.Match(path) {
-			return true
+	cc := strings.ToLower(respHeader.Get("Cache-Control"))
+	if strings.Contains(cc, "no-store") || strings.Contains(cc, "no-cache") || strings.Contains(cc, "private") {
+		return false
+	}
+	// We force Accept-Encoding: identity upstream, so a Vary on Accept-Encoding
+	// is harmless. Any other Vary means the origin serves per-request variants
+	// that our path/host/query key cannot distinguish, so we refuse to cache.
+	if v := respHeader.Get("Vary"); strings.TrimSpace(v) != "" {
+		for _, f := range strings.Split(v, ",") {
+			switch strings.ToLower(strings.TrimSpace(f)) {
+			case "", "accept-encoding":
+			default:
+				return false
+			}
 		}
 	}
-	return false
+	return true
 }
 
-func (h *Handler) serveSingleRangeFromCache(w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time, rangeHdr string) bool {
+// storedResponseHeader returns the response headers to persist in cache
+// metadata. It drops hop-by-hop headers and Set-Cookie, which must never be
+// replayed to other clients from cache.
+func storedResponseHeader(in http.Header) http.Header {
+	out := filterHopByHopResponseHeaders(in)
+	out.Del("Set-Cookie")
+	return out
+}
+
+func (h *Handler) serveSingleRangeFromCache(s *site, w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time, rangeHdr string) bool {
 	// Only support "bytes=<start>-<end>", "bytes=<start>-", "bytes=-<suffix>" and only a single range.
 	// If unsupported, return false to fallback to proxying.
 	size := meta.Size
@@ -251,7 +497,7 @@ func (h *Handler) serveSingleRangeFromCache(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.Header().Set("X-ProxyBuff-Cache", "HIT")
 
-	if h.cfg.AgeHeader {
+	if s.ageHeader {
 		age := int(now.Sub(meta.CreatedAt).Seconds())
 		if age < 0 {
 			age = 0
@@ -330,38 +576,49 @@ func parseSingleByteRange(h string, size int64) (start int64, end int64, ok bool
 	return s, e, true
 }
 
-func (h *Handler) maybeFillFullInBackground(r *http.Request) {
+func (h *Handler) maybeFillFullInBackground(s *site, r *http.Request) {
 	// Only for GET (HEAD doesn't need body).
 	if r.Method != http.MethodGet {
 		return
 	}
 
-	path := r.URL.Path
-	key := cache.KeyForPath(path)
+	k := h.cacheKey(s, r)
+	key := k.Hash()
 	unlock, ok := h.locks.TryLock(key)
 	if !ok {
 		return
 	}
 
+	// Bound the number of concurrent background full downloads to avoid an
+	// amplification vector (many distinct Range misses each pulling a full file).
+	select {
+	case h.bgSem <- struct{}{}:
+	default:
+		unlock()
+		return
+	}
+
 	// If we got the lock, do the full fetch in a goroutine to not block this request.
 	go func() {
+		defer func() { <-h.bgSem }()
 		defer unlock()
 
 		// If another request filled it while we were queued to run, avoid extra origin hit.
-		_, _, fresh, err := h.cacheDisk.LoadFresh(path, time.Now())
-		if err == nil && fresh {
+		if _, _, fresh, err := h.cacheDisk.LoadFresh(key, time.Now()); err == nil && fresh {
 			return
 		}
 
-		h.fetchFullToCache(r, path)
+		h.fetchFullToCache(s, r, k)
 	}()
 }
 
-func (h *Handler) fetchFullToCache(src *http.Request, path string) {
-	upstreamURL := h.upstreamURL(src.URL)
+func (h *Handler) fetchFullToCache(s *site, src *http.Request, k cache.Key) {
+	upstreamURL := s.upstreamURL(src.URL)
 
-	// Detach from the client request: this fill should continue even if the client disconnects.
-	ctx := context.Background()
+	// Detach from the client request but cap the lifetime so a slow origin can't
+	// hold the per-key lock and a goroutine indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL.String(), nil)
 	if err != nil {
 		return
@@ -374,25 +631,26 @@ func (h *Handler) fetchFullToCache(src *http.Request, path string) {
 	req.Header.Set("Accept-Encoding", "identity")
 
 	// Preserve Host behavior.
-	if h.cfg.UseOriginHost {
-		req.Host = h.origin.Host
+	if s.useOriginHost {
+		req.Host = s.origin.Host
 	} else {
 		req.Host = src.Host
 	}
 
-	resp, err := h.client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK || !cacheableResponse(resp.Header, src.Header) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return
 	}
 
 	now := time.Now()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(path)
+	key := k.Hash()
+	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(key)
 	if err != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return
@@ -419,15 +677,18 @@ func (h *Handler) fetchFullToCache(src *http.Request, path string) {
 		return
 	}
 
-	storedHeader := filterHopByHopResponseHeaders(resp.Header)
+	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(n, 10))
 
 	meta := &cache.Meta{
-		Path:      path,
+		Path:      k.Path,
+		Site:      k.Site,
+		Host:      k.Host,
+		Query:     k.Query,
 		Status:    resp.StatusCode,
 		Header:    storedHeader,
 		CreatedAt: now,
-		ExpiresAt: now.Add(h.cacheDisk.TTL),
+		ExpiresAt: now.Add(s.ttl),
 		Size:      n,
 	}
 
@@ -437,17 +698,17 @@ func (h *Handler) fetchFullToCache(src *http.Request, path string) {
 		return
 	}
 
-	if h.recache != nil {
-		h.recache.Update(path, meta.ExpiresAt)
+	if s.recache != nil {
+		s.recache.Update(k, meta.ExpiresAt)
 	}
 }
 
-func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time) {
+func (h *Handler) serveFromCache(s *site, w http.ResponseWriter, r *http.Request, meta *cache.Meta, f *os.File, now time.Time) {
 	// Serve headers from cached meta (filtered at store-time), plus ProxyBuff diagnostics.
 	copyHeader(w.Header(), meta.Header)
 	w.Header().Set("X-ProxyBuff-Cache", "HIT")
 
-	if h.cfg.AgeHeader {
+	if s.ageHeader {
 		age := int(now.Sub(meta.CreatedAt).Seconds())
 		if age < 0 {
 			age = 0
@@ -474,8 +735,8 @@ var bufPool = sync.Pool{
 	},
 }
 
-func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
-	upstreamURL := h.upstreamURL(r.URL)
+func (h *Handler) fetchAndCache(s *site, w http.ResponseWriter, r *http.Request, k cache.Key) {
+	upstreamURL := s.upstreamURL(r.URL)
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL.String(), nil)
 	if err != nil {
@@ -504,13 +765,13 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("X-Forwarded-Proto", "http")
 	}
 
-	if h.cfg.UseOriginHost {
-		req.Host = h.origin.Host
+	if s.useOriginHost {
+		req.Host = s.origin.Host
 	} else {
 		req.Host = r.Host
 	}
 
-	resp, err := h.client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
@@ -523,14 +784,16 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-ProxyBuff-Cache", "MISS")
 	w.WriteHeader(resp.StatusCode)
 
-	if resp.StatusCode != http.StatusOK {
+	// Cache only 200 OK responses the origin (and request) allow to be shared.
+	if resp.StatusCode != http.StatusOK || !cacheableResponse(resp.Header, r.Header) {
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
 
 	// Prepare cache write.
 	now := time.Now()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(r.URL.Path)
+	key := k.Hash()
+	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(key)
 	if err != nil {
 		// Can't cache; just proxy body.
 		_, _ = io.Copy(w, resp.Body)
@@ -675,15 +938,18 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storedHeader := filterHopByHopResponseHeaders(resp.Header)
+	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(cachedBytes, 10))
 
 	meta := &cache.Meta{
-		Path:      r.URL.Path,
+		Path:      k.Path,
+		Site:      k.Site,
+		Host:      k.Host,
+		Query:     k.Query,
 		Status:    resp.StatusCode,
 		Header:    storedHeader,
 		CreatedAt: now,
-		ExpiresAt: now.Add(h.cacheDisk.TTL),
+		ExpiresAt: now.Add(s.ttl),
 		Size:      cachedBytes,
 	}
 
@@ -693,18 +959,10 @@ func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify scheduler if this path is configured for recache.
-	if h.recache != nil {
-		h.recache.Update(r.URL.Path, meta.ExpiresAt)
+	// Notify scheduler if this entry is configured for recache.
+	if s.recache != nil {
+		s.recache.Update(k, meta.ExpiresAt)
 	}
-}
-
-func (h *Handler) upstreamURL(in *url.URL) *url.URL {
-	u := *h.origin
-	u.Path = singleJoiningSlash(h.origin.Path, in.Path)
-	u.RawQuery = in.RawQuery
-	u.Fragment = ""
-	return &u
 }
 
 func singleJoiningSlash(a, b string) string {

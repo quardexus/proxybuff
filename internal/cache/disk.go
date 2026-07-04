@@ -1,3 +1,9 @@
+// ════════════════════════════════════════════════════════════
+//   QUARDEXUS · functional entity
+// ════════════════════════════════════════════════════════════
+// ProxyBuff · high-load caching reverse proxy with auto-TLS
+// SPDX-License-Identifier: Apache-2.0 · © 2026 Quardexus
+
 package cache
 
 import (
@@ -17,6 +23,9 @@ import (
 
 type Meta struct {
 	Path      string      `json:"path"`
+	Site      string      `json:"site,omitempty"`
+	Host      string      `json:"host,omitempty"`
+	Query     string      `json:"query,omitempty"`
 	Status    int         `json:"status"`
 	Header    http.Header `json:"header"`
 	CreatedAt time.Time   `json:"createdAt"`
@@ -39,9 +48,29 @@ func (d Disk) Validate() error {
 	return nil
 }
 
-func KeyForPath(path string) string {
-	sum := sha256.Sum256([]byte(path))
-	return hex.EncodeToString(sum[:])
+// Key identifies a cache entry. Site namespaces entries per configured host so
+// that different origins never collide on the same path. Path is always part of
+// the identity; Host and Query are included only when the operator enables
+// --cache-vary-host and --cache-key-query respectively (both on by default).
+type Key struct {
+	Site  string
+	Path  string
+	Host  string
+	Query string
+}
+
+// Hash returns the on-disk identity for the key: a hex-encoded SHA-256 over the
+// null-separated components in a fixed order.
+func (k Key) Hash() string {
+	h := sha256.New()
+	h.Write([]byte(k.Site))
+	h.Write([]byte{0})
+	h.Write([]byte(k.Path))
+	h.Write([]byte{0})
+	h.Write([]byte(k.Host))
+	h.Write([]byte{0})
+	h.Write([]byte(k.Query))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (d Disk) Paths(key string) (dir, bodyPath, metaPath string) {
@@ -54,8 +83,7 @@ func (d Disk) Paths(key string) (dir, bodyPath, metaPath string) {
 	return
 }
 
-func (d Disk) LoadFresh(path string, now time.Time) (*Meta, *os.File, bool, error) {
-	key := KeyForPath(path)
+func (d Disk) LoadFresh(key string, now time.Time) (*Meta, *os.File, bool, error) {
 	_, bodyPath, metaPath := d.Paths(key)
 
 	meta, err := readMeta(metaPath)
@@ -80,8 +108,7 @@ func (d Disk) LoadFresh(path string, now time.Time) (*Meta, *os.File, bool, erro
 	return meta, f, true, nil
 }
 
-func (d Disk) PrepareWrite(path string) (key string, dir string, tmpBody string, tmpMeta string, bodyFinal string, metaFinal string, err error) {
-	key = KeyForPath(path)
+func (d Disk) PrepareWrite(key string) (_ string, dir string, tmpBody string, tmpMeta string, bodyFinal string, metaFinal string, err error) {
 	dir, bodyFinal, metaFinal = d.Paths(key)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", "", "", "", "", fmt.Errorf("mkdir cache dir: %w", err)

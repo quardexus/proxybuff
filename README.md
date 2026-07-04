@@ -1,8 +1,30 @@
 # ProxyBuff
 
-High-load HTTP reverse proxy with disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew).
+> **High-load HTTP reverse proxy** with a disk-backed TTL cache for selected paths and automatic Let's Encrypt TLS (auto-issue + auto-renew), plus multi-host routing with per-domain certificates.
 
-Developed by **Quardexus**. Version **v1.3.2**.
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
+![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)
+![Release](https://img.shields.io/badge/release-v1.4.0-success)
+![QUARDEXUS](https://img.shields.io/badge/QUARDEXUS-functional%20entity-000000)
+
+## Features
+
+- **Disk-backed TTL cache** — matched paths are stored on disk and served with **zero origin requests** on a HIT.
+- **Multi-host** — serve many domains from one instance, each with its own origin, cache rules and TLS certificate; **wildcard** host matching (`*.example.com`).
+- **Automatic TLS** — Let's Encrypt certificates via ACME HTTP-01, auto-issued and auto-renewed per hostname.
+- **Range requests** — a single range (`206`) is served straight from cached files; the full file is back-filled in the background.
+- **Refresh-ahead (recache)** — configured entries are refreshed in the background before they expire, even with no traffic.
+- **Safe by default** — never caches authenticated or `no-store`/`private` responses, never stores or replays `Set-Cookie`; Slowloris-resistant timeouts.
+- **Single static binary** — pure Go, no CGO; Linux / macOS / Windows on amd64 & arm64.
+
+## Table of contents
+
+- [What it does](#what-it-does) · [Caching rules](#caching-rules-v140) · [Cache patterns](#cache-patterns)
+- [Recache](#auto-refresh-cache-recache) · [Multi-host](#multi-host-multiple-domains-and-origins)
+- [Build](#install--build-locally) · [Run](#run-locally-binary) · [Docker](#docker) · [Status](#status-command) · [Flags](#flags)
+- [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+_By **QUARDEXUS · functional entity** — licensed under [Apache-2.0](LICENSE)._
 
 ## What it does
 
@@ -16,15 +38,18 @@ Developed by **Quardexus**. Version **v1.3.2**.
 - **Origin / upstream**: the backend ProxyBuff proxies to (flag `--origin`), e.g. `https://81.177.139.61:443`.
 - **TLS domain**: domain name(s) ProxyBuff requests Let's Encrypt certificates for (flag `--tls-domain`). This must be the **public domain**, not the origin.
 
-## Caching rules (v1.3.2)
+## Caching rules (v1.4.0)
 
 - **Methods**: only `GET` is cached. `HEAD` can be served from an existing cached `GET` entry, but **does not populate** the cache.
 - **Status codes**: only `200 OK` responses are cached.
+- **Never cached** (streamed through as a normal `MISS`): responses with `Cache-Control: no-store`, `no-cache` or `private`; responses that `Vary` on anything other than `Accept-Encoding`; and any request that carries an `Authorization` header. `Set-Cookie` is **never stored** in cache metadata (so a cached response can never replay another client's cookie), though it is still passed through on the original `MISS`.
 - **Range requests** (`Range:` header):
   - If the full file is already cached, ProxyBuff serves a **single byte range** (`206`) from disk.
   - Otherwise, ProxyBuff proxies the range request and downloads the full file in the background to populate cache for next time.
   - **Multi-range** requests (e.g. `bytes=0-99,200-299`) are **not supported** for cache serving and are proxied.
-- **Cache key**: **path only** (`/some/file.png`). Query string is **ignored for the cache key**, but is still forwarded to the origin.
+- **Cache key**: by default the key combines the request **path**, **Host** and **query string**, and is additionally **namespaced per configured host** so different origins never collide on the same path.
+  - `--cache-key-query=false` drops the query string from the key (path-only matching); the query is still forwarded to the origin either way.
+  - `--cache-vary-host=false` drops the Host from the key (one cached variant shared across all `Host` headers).
 - **Response headers**:
   - On HIT, headers come from cached metadata and are sent “as stored”.
   - ProxyBuff always adds `X-ProxyBuff-Cache: HIT|MISS`.
@@ -64,6 +89,50 @@ Defaults:
 
 - `--recache-ahead=5m`
 - `--recache-workers=4`
+
+## Multi-host (multiple domains and origins)
+
+A single ProxyBuff instance can serve several domains, each with its **own origin**, cache rules and TLS certificate. This is configured via the **JSON config file only** (the CLI flags remain single-origin). When no `hosts` are configured, ProxyBuff behaves exactly as before — this is fully backward compatible.
+
+Each entry in `hosts[]`:
+
+- `match` (**required**): one or more hostnames to route. Supports a single leading **wildcard label**, e.g. `*.example.com` matches `a.example.com` but **not** `example.com` or `a.b.example.com`.
+- `origin` (optional): upstream for this host. If omitted, the **top-level `origin`** is inherited.
+- `cache`, `recache`, `ttl`, `useOriginHost`, `insecureSkipVerify`, `ageHeader` (optional): override the top-level defaults for this host; omitted fields are inherited.
+- `tlsDomains` (optional): certificate domains for this host. If omitted, it defaults to the **non-wildcard** entries of `match`.
+
+Requests whose `Host` matches no entry fall back to the **top-level `origin`** (if set); otherwise they receive `502`. Exact matches win over wildcard matches.
+
+Example `config.json`:
+
+```json
+{
+  "httpListen": "0.0.0.0:80",
+  "httpsEnabled": true,
+  "httpsListen": "0.0.0.0:443",
+  "ttl": "10m",
+  "cache": ["*.png", "*.jpg", "/assets/*"],
+  "hosts": [
+    {
+      "match": ["shopa.com", "www.shopa.com"],
+      "origin": "https://10.0.0.11:443",
+      "tlsDomains": ["shopa.com", "www.shopa.com"]
+    },
+    {
+      "match": ["*.shopb.com"],
+      "origin": "https://10.0.0.12:8443",
+      "cache": ["/static/*"],
+      "tlsDomains": ["*.shopb.com", "shopb.com"]
+    }
+  ]
+}
+```
+
+Run it with `proxybuff --config config.json` (in Docker, mount the file and pass `--config /path/config.json`).
+
+### Certificates and wildcards
+
+ProxyBuff obtains and renews certificates automatically via ACME **HTTP-01**, one certificate **per concrete hostname**, on demand the first time each host is requested. A `*.example.com` pattern therefore lets **any** subdomain be served and receive its own certificate automatically — it does **not** obtain a single true wildcard certificate. Let's Encrypt issues wildcard certificates only via **DNS-01**, which ProxyBuff does not implement. When using wildcards, keep port **80** reachable so each subdomain can complete its HTTP-01 challenge.
 
 ## Install / build locally
 
@@ -175,7 +244,7 @@ docker exec -it <container_name_or_id> proxybuff-clear-cache /var/lib/proxybuff/
 You can view the current cache status (cached files, size, expiration) without running the server:
 
 ```bash
-# From binary (looks in ./cache by default)
+# From binary (looks in ./cache by default, or uses ./config.json next to the binary if present)
 ./proxybuff status
 
 # Specify cache directory
@@ -205,6 +274,10 @@ You can view the current cache status (cached files, size, expiration) without r
 - `--age-header` (default `false`): add standard `Age` header on cache HIT
 - `--use-origin-host` (default `false`): send `Host` from `--origin` (by default forwards the original client `Host`)
 - `--insecure-skip-verify` (default `false`): skip TLS certificate verification for https origins (dangerous)
+- `--cache-vary-host` (default `true`): include the request `Host` in the cache key. Disable with `--cache-vary-host=false`.
+- `--cache-key-query` (default `true`): include the query string in the cache key. Disable with `--cache-key-query=false`.
+
+> Multi-host routing (several domains/origins from one instance) is configured via the JSON config file — see [Multi-host](#multi-host-multiple-domains-and-origins).
 
 ## License
 

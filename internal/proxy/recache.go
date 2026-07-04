@@ -1,3 +1,9 @@
+// ════════════════════════════════════════════════════════════
+//   QUARDEXUS · functional entity
+// ════════════════════════════════════════════════════════════
+// ProxyBuff · high-load caching reverse proxy with auto-TLS
+// SPDX-License-Identifier: Apache-2.0 · © 2026 Quardexus
+
 package proxy
 
 import (
@@ -21,10 +27,12 @@ import (
 )
 
 type recacheScheduler struct {
+	siteID  string
 	disk    cache.Disk
 	origin  *url.URL
 	client  *http.Client
 	locks   *keyedLocker
+	ttl     time.Duration
 	ahead   time.Duration
 	workers int
 
@@ -32,14 +40,14 @@ type recacheScheduler struct {
 
 	mu       sync.Mutex
 	pq       recachePQ
-	byPath   map[string]*recacheItem
+	byKey    map[string]*recacheItem
 	inFlight map[string]struct{}
 
 	wakeCh chan struct{}
-	taskCh chan string
+	taskCh chan cache.Key
 }
 
-func newRecacheScheduler(disk cache.Disk, origin *url.URL, client *http.Client, locks *keyedLocker, matchers []cache.Matcher, ahead time.Duration, workers int) *recacheScheduler {
+func newRecacheScheduler(siteID string, disk cache.Disk, origin *url.URL, client *http.Client, locks *keyedLocker, matchers []cache.Matcher, ttl, ahead time.Duration, workers int) *recacheScheduler {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -47,17 +55,19 @@ func newRecacheScheduler(disk cache.Disk, origin *url.URL, client *http.Client, 
 		ahead = 0
 	}
 	s := &recacheScheduler{
+		siteID:   siteID,
 		disk:     disk,
 		origin:   origin,
 		client:   client,
 		locks:    locks,
+		ttl:      ttl,
 		ahead:    ahead,
 		workers:  workers,
 		matchers: matchers,
-		byPath:   make(map[string]*recacheItem),
+		byKey:    make(map[string]*recacheItem),
 		inFlight: make(map[string]struct{}),
 		wakeCh:   make(chan struct{}, 1),
-		taskCh:   make(chan string, workers*4),
+		taskCh:   make(chan cache.Key, workers*4),
 	}
 	heap.Init(&s.pq)
 	return s
@@ -85,28 +95,29 @@ func (s *recacheScheduler) shouldRecache(path string) bool {
 	return false
 }
 
-func (s *recacheScheduler) Update(path string, expiresAt time.Time) {
-	if strings.TrimSpace(path) == "" {
+func (s *recacheScheduler) Update(k cache.Key, expiresAt time.Time) {
+	if strings.TrimSpace(k.Path) == "" {
 		return
 	}
-	if !s.shouldRecache(path) {
+	if !s.shouldRecache(k.Path) {
 		return
 	}
-	refreshAt := expiresAt.Add(-s.ahead)
-	s.scheduleAt(path, refreshAt)
+	s.scheduleAt(k, expiresAt.Add(-s.ahead))
 }
 
-func (s *recacheScheduler) scheduleAt(path string, at time.Time) {
+func (s *recacheScheduler) scheduleAt(k cache.Key, at time.Time) {
+	id := k.Hash()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if it, ok := s.byPath[path]; ok {
+	if it, ok := s.byKey[id]; ok {
 		it.at = at
+		it.key = k
 		heap.Fix(&s.pq, it.index)
 	} else {
-		it := &recacheItem{path: path, at: at}
+		it := &recacheItem{key: k, at: at}
 		heap.Push(&s.pq, it)
-		s.byPath[path] = it
+		s.byKey[id] = it
 	}
 
 	select {
@@ -155,7 +166,7 @@ func (s *recacheScheduler) loop(ctx context.Context) {
 }
 
 func (s *recacheScheduler) dispatchDue(now time.Time) {
-	var due []string
+	var due []cache.Key
 
 	s.mu.Lock()
 	for s.pq.Len() > 0 {
@@ -164,21 +175,22 @@ func (s *recacheScheduler) dispatchDue(now time.Time) {
 			break
 		}
 		heap.Pop(&s.pq)
-		delete(s.byPath, it.path)
-		if _, ok := s.inFlight[it.path]; ok {
+		id := it.key.Hash()
+		delete(s.byKey, id)
+		if _, ok := s.inFlight[id]; ok {
 			continue
 		}
-		s.inFlight[it.path] = struct{}{}
-		due = append(due, it.path)
+		s.inFlight[id] = struct{}{}
+		due = append(due, it.key)
 	}
 	s.mu.Unlock()
 
-	for _, p := range due {
+	for _, k := range due {
 		select {
-		case s.taskCh <- p:
+		case s.taskCh <- k:
 		default:
 			// Backpressure: reschedule soon and drop inFlight.
-			s.finishTaskAndReschedule(p, now.Add(10*time.Second))
+			s.finishTaskAndReschedule(k, now.Add(10*time.Second))
 		}
 	}
 }
@@ -188,39 +200,39 @@ func (s *recacheScheduler) worker(ctx context.Context, idx int) {
 		select {
 		case <-ctx.Done():
 			return
-		case path := <-s.taskCh:
-			s.refreshOne(ctx, path)
+		case k := <-s.taskCh:
+			s.refreshOne(ctx, k)
 		}
 	}
 }
 
-func (s *recacheScheduler) refreshOne(ctx context.Context, path string) {
+func (s *recacheScheduler) refreshOne(ctx context.Context, k cache.Key) {
 	// TryLock to avoid blocking user traffic. If busy, retry soon.
-	key := cache.KeyForPath(path)
-	unlock, ok := s.locks.TryLock(key)
+	keyHash := k.Hash()
+	unlock, ok := s.locks.TryLock(keyHash)
 	if !ok {
-		s.finishTaskAndReschedule(path, time.Now().Add(15*time.Second))
+		s.finishTaskAndReschedule(k, time.Now().Add(15*time.Second))
 		return
 	}
 	defer unlock()
 
 	// If it got refreshed by user traffic while we were waiting in queue,
 	// reading meta here avoids extra origin hit.
-	meta, _, fresh, err := s.disk.LoadFresh(path, time.Now())
+	meta, _, fresh, err := s.disk.LoadFresh(keyHash, time.Now())
 	if err == nil && fresh {
 		// Still schedule the next refresh based on current expiry.
-		s.finishTaskAndReschedule(path, meta.ExpiresAt.Add(-s.ahead))
+		s.finishTaskAndReschedule(k, meta.ExpiresAt.Add(-s.ahead))
 		return
 	}
 
-	expiresAt, err := s.fetchToCache(ctx, path)
+	expiresAt, err := s.fetchToCache(ctx, k)
 	if err != nil {
-		log.Printf("recache: refresh failed for %s: %v", path, err)
-		s.finishTaskAndReschedule(path, time.Now().Add(s.retryDelay()))
+		log.Printf("recache: refresh failed for %s: %v", k.Path, err)
+		s.finishTaskAndReschedule(k, time.Now().Add(s.retryDelay()))
 		return
 	}
 
-	s.finishTaskAndReschedule(path, expiresAt.Add(-s.ahead))
+	s.finishTaskAndReschedule(k, expiresAt.Add(-s.ahead))
 }
 
 func (s *recacheScheduler) retryDelay() time.Duration {
@@ -241,25 +253,25 @@ func (s *recacheScheduler) retryDelay() time.Duration {
 	return d
 }
 
-func (s *recacheScheduler) finishTaskAndReschedule(path string, nextAt time.Time) {
+func (s *recacheScheduler) finishTaskAndReschedule(k cache.Key, nextAt time.Time) {
 	s.mu.Lock()
-	delete(s.inFlight, path)
+	delete(s.inFlight, k.Hash())
 	s.mu.Unlock()
 
 	// If nextAt is zero/too early, normalize.
 	if nextAt.IsZero() {
 		nextAt = time.Now().Add(30 * time.Second)
 	}
-	if !s.shouldRecache(path) {
+	if !s.shouldRecache(k.Path) {
 		return
 	}
-	s.scheduleAt(path, nextAt)
+	s.scheduleAt(k, nextAt)
 }
 
-func (s *recacheScheduler) fetchToCache(ctx context.Context, path string) (time.Time, error) {
+func (s *recacheScheduler) fetchToCache(ctx context.Context, k cache.Key) (time.Time, error) {
 	u := *s.origin
-	u.Path = singleJoiningSlash(s.origin.Path, path)
-	u.RawQuery = ""
+	u.Path = singleJoiningSlash(s.origin.Path, k.Path)
+	u.RawQuery = k.Query
 	u.Fragment = ""
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -267,7 +279,12 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, path string) (time.
 		return time.Time{}, err
 	}
 	req.Header.Set("Accept-Encoding", "identity")
-	req.Host = s.origin.Host
+	// Refresh the exact variant we stored: use the entry's Host if it was keyed on it.
+	if k.Host != "" {
+		req.Host = k.Host
+	} else {
+		req.Host = s.origin.Host
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -279,9 +296,14 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, path string) (time.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return time.Time{}, fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
+	if !cacheableResponse(resp.Header, req.Header) {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return time.Time{}, fmt.Errorf("response not cacheable")
+	}
 
 	now := time.Now()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := s.disk.PrepareWrite(path)
+	key := k.Hash()
+	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := s.disk.PrepareWrite(key)
 	if err != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return time.Time{}, err
@@ -310,11 +332,14 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, path string) (time.
 		return time.Time{}, err
 	}
 
-	storedHeader := filterHopByHopResponseHeaders(resp.Header)
+	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(n, 10))
-	expiresAt := now.Add(s.disk.TTL)
+	expiresAt := now.Add(s.ttl)
 	meta := &cache.Meta{
-		Path:      path,
+		Path:      k.Path,
+		Site:      k.Site,
+		Host:      k.Host,
+		Query:     k.Query,
 		Status:    resp.StatusCode,
 		Header:    storedHeader,
 		CreatedAt: now,
@@ -361,21 +386,26 @@ func (s *recacheScheduler) seedFromDisk() {
 			// Older cache entries (before v1.2.0) can't be recached.
 			return nil
 		}
+		if m.Site != s.siteID {
+			// Belongs to a different site's namespace.
+			return nil
+		}
 		if !s.shouldRecache(m.Path) {
 			return nil
 		}
+		k := cache.Key{Site: m.Site, Path: m.Path, Host: m.Host, Query: m.Query}
 		// If already expired, schedule immediate refresh.
 		refreshAt := m.ExpiresAt.Add(-s.ahead)
 		if now.After(m.ExpiresAt) || refreshAt.Before(now) {
 			refreshAt = now
 		}
-		s.scheduleAt(m.Path, refreshAt)
+		s.scheduleAt(k, refreshAt)
 		return nil
 	})
 }
 
 type recacheItem struct {
-	path  string
+	key   cache.Key
 	at    time.Time
 	index int
 }

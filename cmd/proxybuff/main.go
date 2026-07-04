@@ -1,3 +1,9 @@
+// ════════════════════════════════════════════════════════════
+//   QUARDEXUS · functional entity
+// ════════════════════════════════════════════════════════════
+// ProxyBuff · high-load caching reverse proxy with auto-TLS
+// SPDX-License-Identifier: Apache-2.0 · © 2026 Quardexus
+
 package main
 
 import (
@@ -137,24 +143,38 @@ func stripWriteEffectiveConfig(args []string, outPath *string) []string {
 }
 
 func writeEffectiveConfig(path string, cfg config.Config) error {
-	type fileCfg struct {
-		Listen             string   `json:"listen"`
-		HTTPEnabled        bool     `json:"httpEnabled"`
-		HttpListen         string   `json:"httpListen"`
-		HTTPSEnabled       bool     `json:"httpsEnabled"`
-		HttpsListen        string   `json:"httpsListen"`
-		TLSDomains         []string `json:"tlsDomains"`
-		Origin             string   `json:"origin"`
-		CacheDir           string   `json:"cacheDir"`
-		LogFile            string   `json:"logFile"`
-		TTL                string   `json:"ttl"`
-		Cache              []string `json:"cache"`
-		Recache            []string `json:"recache"`
-		RecacheAhead       string   `json:"recacheAhead"`
-		RecacheWorkers     int      `json:"recacheWorkers"`
-		AgeHeader          bool     `json:"ageHeader"`
+	type fileHost struct {
+		Match              []string `json:"match,omitempty"`
+		Origin             string   `json:"origin,omitempty"`
+		Cache              []string `json:"cache,omitempty"`
+		Recache            []string `json:"recache,omitempty"`
+		TTL                string   `json:"ttl,omitempty"`
+		TLSDomains         []string `json:"tlsDomains,omitempty"`
 		UseOriginHost      bool     `json:"useOriginHost"`
 		InsecureSkipVerify bool     `json:"insecureSkipVerify"`
+		AgeHeader          bool     `json:"ageHeader"`
+	}
+	type fileCfg struct {
+		Listen             string     `json:"listen"`
+		HTTPEnabled        bool       `json:"httpEnabled"`
+		HttpListen         string     `json:"httpListen"`
+		HTTPSEnabled       bool       `json:"httpsEnabled"`
+		HttpsListen        string     `json:"httpsListen"`
+		TLSDomains         []string   `json:"tlsDomains"`
+		Origin             string     `json:"origin"`
+		CacheDir           string     `json:"cacheDir"`
+		LogFile            string     `json:"logFile"`
+		TTL                string     `json:"ttl"`
+		Cache              []string   `json:"cache"`
+		Recache            []string   `json:"recache"`
+		RecacheAhead       string     `json:"recacheAhead"`
+		RecacheWorkers     int        `json:"recacheWorkers"`
+		AgeHeader          bool       `json:"ageHeader"`
+		UseOriginHost      bool       `json:"useOriginHost"`
+		InsecureSkipVerify bool       `json:"insecureSkipVerify"`
+		CacheVaryHost      bool       `json:"cacheVaryHost"`
+		CacheKeyQuery      bool       `json:"cacheKeyQuery"`
+		Hosts              []fileHost `json:"hosts,omitempty"`
 	}
 
 	payload := fileCfg{
@@ -175,6 +195,22 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		AgeHeader:          cfg.AgeHeader,
 		UseOriginHost:      cfg.UseOriginHost,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		CacheVaryHost:      cfg.CacheVaryHost,
+		CacheKeyQuery:      cfg.CacheKeyQuery,
+	}
+
+	for _, hc := range cfg.Hosts {
+		payload.Hosts = append(payload.Hosts, fileHost{
+			Match:              hc.Match,
+			Origin:             hc.Origin,
+			Cache:              hc.Cache,
+			Recache:            hc.Recache,
+			TTL:                hc.TTL.String(),
+			TLSDomains:         hc.TLSDomains,
+			UseOriginHost:      hc.UseOriginHost,
+			InsecureSkipVerify: hc.InsecureSkipVerify,
+			AgeHeader:          hc.AgeHeader,
+		})
 	}
 
 	b, err := json.MarshalIndent(payload, "", "  ")
@@ -203,19 +239,24 @@ func setupLogging(path string) (closeFn func()) {
 	return func() { _ = f.Close() }
 }
 
-func runServers(ctx context.Context, cfg config.Config, h http.Handler) error {
-	log.Printf("%s %s starting, origin=%s", version.Project, version.Version, cfg.Origin)
+func runServers(ctx context.Context, cfg config.Config, h *proxy.Handler) error {
+	if len(cfg.Hosts) > 0 {
+		log.Printf("%s %s starting, hosts=%d, defaultOrigin=%q", version.Project, version.Version, len(cfg.Hosts), cfg.Origin)
+	} else {
+		log.Printf("%s %s starting, origin=%s", version.Project, version.Version, cfg.Origin)
+	}
 
 	var certMgr *autocert.Manager
 	if cfg.HTTPSEnabled {
 		certDir := filepath.Join(cfg.CacheDir, "certs")
-		log.Printf("https enabled: listen=%s, certCache=%s, domains=%s", cfg.HttpsListen, certDir, strings.Join(cfg.TLSDomains, ","))
+		log.Printf("https enabled: listen=%s, certCache=%s, domains=%s", cfg.HttpsListen, certDir, strings.Join(h.TLSDomains(), ","))
 		log.Printf("acme note: ensure external TCP/80 is forwarded to this instance's HTTP listener for HTTP-01 challenges")
+		log.Printf("acme note: wildcard domains obtain a separate certificate per subdomain on demand (HTTP-01); a single true wildcard certificate would require DNS-01, which is not supported")
 
 		certMgr = &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			Cache:      autocert.DirCache(certDir),
-			HostPolicy: autocert.HostWhitelist(cfg.TLSDomains...),
+			HostPolicy: h.HostPolicy,
 		}
 	}
 
@@ -224,7 +265,7 @@ func runServers(ctx context.Context, cfg config.Config, h http.Handler) error {
 	var servers []*http.Server
 
 	if cfg.HTTPEnabled {
-		handler := h
+		var handler http.Handler = h
 		if certMgr != nil {
 			// When HTTPS is enabled, use HTTP only for ACME HTTP-01 challenges and redirect everything else.
 			handler = certMgr.HTTPHandler(redirectToHTTPSHandler(cfg.HttpsListen))
@@ -232,7 +273,12 @@ func runServers(ctx context.Context, cfg config.Config, h http.Handler) error {
 		} else {
 			log.Printf("http enabled: listen=%s", cfg.HttpListen)
 		}
-		srv := &http.Server{Addr: cfg.HttpListen, Handler: handler}
+		srv := &http.Server{
+			Addr:              cfg.HttpListen,
+			Handler:           handler,
+			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 		servers = append(servers, srv)
 		started++
 		go func() {
@@ -249,6 +295,7 @@ func runServers(ctx context.Context, cfg config.Config, h http.Handler) error {
 			Handler:           h,
 			TLSConfig:         certMgr.TLSConfig(),
 			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
 		servers = append(servers, httpsSrv)
 		started++
@@ -326,18 +373,6 @@ func hostWithPort(hostport string, httpsPort string) string {
 	return host + ":" + httpsPort
 }
 
-func isPort(addr, port string) bool {
-	_, p, err := net.SplitHostPort(addr)
-	if err == nil {
-		return p == port
-	}
-	// allow ":80"
-	if strings.HasPrefix(addr, ":") {
-		return strings.TrimPrefix(addr, ":") == port
-	}
-	return false
-}
-
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("proxybuff status", flag.ExitOnError)
 	cacheDir := fs.String("cache-dir", "./cache", "cache directory path")
@@ -347,8 +382,32 @@ func runStatus(args []string) {
 		os.Exit(2)
 	}
 
+	isCacheDirExplicit := false
+	isConfigExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "cache-dir":
+			isCacheDirExplicit = true
+		case "config":
+			isConfigExplicit = true
+		}
+	})
+
 	var cfg statusConfig
-	if *configPath != "" {
+	// Default behavior: if neither --cache-dir nor --config was provided, try "./config.json"
+	// next to the proxybuff binary (best-effort).
+	if !isCacheDirExplicit && !isConfigExplicit {
+		if exe, err := os.Executable(); err == nil {
+			if dir := filepath.Dir(exe); strings.TrimSpace(dir) != "" {
+				autoCfg := filepath.Join(dir, "config.json")
+				if _, err := os.Stat(autoCfg); err == nil {
+					*configPath = autoCfg
+				}
+			}
+		}
+	}
+
+	if strings.TrimSpace(*configPath) != "" {
 		var err error
 		cfg, err = readStatusConfig(*configPath)
 		if err != nil {
@@ -356,13 +415,7 @@ func runStatus(args []string) {
 			os.Exit(2)
 		}
 
-		isExplicit := false
-		fs.Visit(func(f *flag.Flag) {
-			if f.Name == "cache-dir" {
-				isExplicit = true
-			}
-		})
-		if !isExplicit && strings.TrimSpace(cfg.CacheDir) != "" {
+		if !isCacheDirExplicit && strings.TrimSpace(cfg.CacheDir) != "" {
 			*cacheDir = cfg.CacheDir
 		}
 	}

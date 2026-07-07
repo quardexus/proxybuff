@@ -39,6 +39,16 @@ func main() {
 		return
 	}
 
+	if len(args) > 0 && args[0] == "clear-cache" {
+		runClearCache(args[1:])
+		return
+	}
+
+	if len(args) > 0 && args[0] == "clear-certs" {
+		runClearCerts(args[1:])
+		return
+	}
+
 	var writeEffectiveConfigPath string
 	args = stripWriteEffectiveConfig(args, &writeEffectiveConfigPath)
 
@@ -93,11 +103,15 @@ func printUsage() {
 Usage:
   proxybuff --origin <url> [--http[=<port|addr>]] [--https[=<port|addr>]] [--cache <pattern>] [--ttl 10m] [--cache-dir ./cache] [--age-header]
   proxybuff --config /path/to/config.json
-  proxybuff status [--cache-dir ./cache] [--config /path/to/config.json]
+  proxybuff status      [--cache-dir ./cache] [--config /path/to/config.json]
+  proxybuff clear-cache [--cache-dir ./cache] [--config /path/to/config.json] [--yes]
+  proxybuff clear-certs [--cache-dir ./cache] [--config /path/to/config.json] [--yes]
   proxybuff --version
 
 Commands:
   status        Show cache statistics and list cached files
+  clear-cache   Remove all cached entries (keeps ACME certs); pass --yes to skip confirmation
+  clear-certs   Remove all cached ACME certificates (forces re-issuance); pass --yes to skip confirmation
 
 Flags:
   --origin      Upstream origin URL to proxy (required). You can also pass host[:port] without scheme.
@@ -480,6 +494,120 @@ func runStatus(args []string) {
 
 	w.Flush()
 	fmt.Printf("\nTotal: %d files, %s\n", count, byteCountIEC(totalSize))
+}
+
+// resolveClearCacheDir applies the shared status/clear cache-dir resolution to
+// the parsed flag set: an explicit --cache-dir wins; otherwise --config's
+// cacheDir is used; otherwise ./config.json next to the binary is tried. It
+// updates *cacheDir in place. cmd is used only for error messages.
+func resolveClearCacheDir(fs *flag.FlagSet, cmd string, cacheDir, configPath *string) {
+	isCacheDirExplicit := false
+	isConfigExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "cache-dir":
+			isCacheDirExplicit = true
+		case "config":
+			isConfigExplicit = true
+		}
+	})
+
+	// Default behavior: if neither --cache-dir nor --config was provided, try
+	// "./config.json" next to the proxybuff binary (best-effort).
+	if !isCacheDirExplicit && !isConfigExplicit {
+		if exe, err := os.Executable(); err == nil {
+			if dir := filepath.Dir(exe); strings.TrimSpace(dir) != "" {
+				autoCfg := filepath.Join(dir, "config.json")
+				if _, err := os.Stat(autoCfg); err == nil {
+					*configPath = autoCfg
+				}
+			}
+		}
+	}
+
+	if strings.TrimSpace(*configPath) != "" {
+		cfg, err := readStatusConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: read config: %v\n", cmd, err)
+			os.Exit(2)
+		}
+		if !isCacheDirExplicit && strings.TrimSpace(cfg.CacheDir) != "" {
+			*cacheDir = cfg.CacheDir
+		}
+	}
+}
+
+func runClearCache(args []string) {
+	fs := flag.NewFlagSet("proxybuff clear-cache", flag.ExitOnError)
+	cacheDir := fs.String("cache-dir", "./cache", "cache directory path")
+	configPath := fs.String("config", "", "path to JSON config file (optional, to read cache-dir)")
+	yes := fs.Bool("yes", false, "skip confirmation and clear immediately")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	resolveClearCacheDir(fs, "clear-cache", cacheDir, configPath)
+
+	cd := cache.Disk{Dir: *cacheDir, TTL: 1} // TTL doesn't matter for clearing
+
+	// Without --yes, report what would be removed and stop (safe, non-interactive).
+	if !*yes {
+		count := 0
+		totalSize := int64(0)
+		err := cd.Walk(func(meta cache.Meta, bodyPath string) error {
+			count++
+			totalSize += meta.Size
+			return nil
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "clear-cache: scan cache: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Would remove %d cached files (%s) from %s\n", count, byteCountIEC(totalSize), *cacheDir)
+		fmt.Println("ACME certificates (certs/) are preserved. Re-run with --yes to confirm.")
+		return
+	}
+
+	deleted, err := cd.ClearCache()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "clear-cache: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Cleared %d cached entries from %s (ACME certs preserved)\n", deleted, *cacheDir)
+}
+
+func runClearCerts(args []string) {
+	fs := flag.NewFlagSet("proxybuff clear-certs", flag.ExitOnError)
+	cacheDir := fs.String("cache-dir", "./cache", "cache directory path")
+	configPath := fs.String("config", "", "path to JSON config file (optional, to read cache-dir)")
+	yes := fs.Bool("yes", false, "skip confirmation and clear immediately")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	resolveClearCacheDir(fs, "clear-certs", cacheDir, configPath)
+
+	cd := cache.Disk{Dir: *cacheDir, TTL: 1} // TTL doesn't matter for clearing
+	certsDir := cd.CertsDir()
+
+	// Without --yes, report what would be removed and stop (safe, non-interactive).
+	if !*yes {
+		entries, err := os.ReadDir(certsDir)
+		if err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "clear-certs: scan certs: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Would remove %d ACME cert-cache entries from %s\n", len(entries), certsDir)
+		fmt.Println("WARNING: next TLS handshake re-issues certs via ACME (mind the CA rate limits). Re-run with --yes to confirm.")
+		return
+	}
+
+	deleted, err := cd.ClearCerts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "clear-certs: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Cleared %d ACME cert-cache entries from %s (certs re-issue on next handshake)\n", deleted, certsDir)
 }
 
 func byteCountIEC(b int64) string {

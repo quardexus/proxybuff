@@ -180,6 +180,86 @@ func (d Disk) SweepExpired(now time.Time) (deleted int, err error) {
 	return deleted, nil
 }
 
+// CertsDir returns the ACME certificate cache directory that lives alongside
+// the HTTP cache (autocert.DirCache in cmd/proxybuff writes here).
+func (d Disk) CertsDir() string {
+	return filepath.Join(strings.TrimSpace(d.Dir), "certs")
+}
+
+// ClearCache removes every cache entry (meta.json + body) under the cache dir
+// and prunes the now-empty entry directory. It deliberately matches only cache
+// entries (identified by a meta.json), so unrelated data living under the same
+// cache dir — notably the ACME "certs/" subdirectory — is left untouched.
+// Best-effort: it continues on individual errors.
+func (d Disk) ClearCache() (deleted int, err error) {
+	root := strings.TrimSpace(d.Dir)
+	if root == "" {
+		return 0, errors.New("cache dir is required")
+	}
+	// If cache dir doesn't exist, nothing to do.
+	if _, statErr := os.Stat(root); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, statErr
+	}
+
+	certsDir := d.CertsDir()
+	walkErr := filepath.WalkDir(root, func(p string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// skip this subtree entry
+			return nil
+		}
+		if de.IsDir() {
+			// Never descend into the ACME cert cache.
+			if p == certsDir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if de.Name() != "meta.json" {
+			return nil
+		}
+
+		dir := filepath.Dir(p)
+		bodyPath := filepath.Join(dir, "body")
+		_ = os.Remove(p)
+		_ = os.Remove(bodyPath)
+		// The entry directory is now empty; prune it (ignores non-empty dirs).
+		_ = os.Remove(dir)
+		deleted++
+		return nil
+	})
+	if walkErr != nil {
+		return deleted, walkErr
+	}
+	return deleted, nil
+}
+
+// ClearCerts removes all cached ACME certificates and account data under the
+// certs/ subdirectory. The next TLS handshake for each domain then triggers a
+// fresh issuance via ACME (subject to the CA's rate limits). Best-effort;
+// returns the number of top-level cert-cache entries removed.
+func (d Disk) ClearCerts() (deleted int, err error) {
+	if strings.TrimSpace(d.Dir) == "" {
+		return 0, errors.New("cache dir is required")
+	}
+	certs := d.CertsDir()
+	entries, readErr := os.ReadDir(certs)
+	if readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, readErr
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(certs, e.Name())); err == nil {
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
 func readMeta(metaPath string) (*Meta, error) {
 	b, err := os.ReadFile(metaPath)
 	if err != nil {

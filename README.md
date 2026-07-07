@@ -21,7 +21,7 @@
 
 - [What it does](#what-it-does) · [Caching rules](#caching-rules-v140) · [Cache patterns](#cache-patterns)
 - [Recache](#auto-refresh-cache-recache) · [Multi-host](#multi-host-multiple-domains-and-origins)
-- [Build](#install--build-locally) · [Run](#run-locally-binary) · [Docker](#docker) · [Status](#status-command) · [Flags](#flags)
+- [Build](#install--build-locally) · [Run](#run-locally-binary) · [Docker](#docker) · [Status](#status-command) · [Clear](#clear-commands) · [Flags](#flags)
 - [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 _By **QUARDEXUS · functional entity** — licensed under [Apache-2.0](LICENSE)._
@@ -252,6 +252,39 @@ You can view the current cache status (cached files, size, expiration) without r
 
 # Or use config file
 ./proxybuff status --config ./config.json
+```
+
+## Clear Commands
+
+Two force-clear commands, both without running the server. Cache-dir resolution is
+identical to `status` (explicit `--cache-dir`, then `--config`, then `./config.json`
+next to the binary). Both print a non-destructive preview unless `--yes` is passed.
+
+**`clear-cache`** — remove all cached HTTP entries. ACME certificates under
+`<cache-dir>/certs` are **preserved**. The server need not be stopped; entries simply
+repopulate on subsequent requests (MISS → fill).
+
+```bash
+# Preview what would be removed (safe)
+./proxybuff clear-cache --cache-dir /var/lib/proxybuff/cache
+
+# Actually clear
+./proxybuff clear-cache --config ./config.json --yes
+```
+
+**`clear-certs`** — remove all cached ACME certificates (and account data) under
+`<cache-dir>/certs`. Cached HTTP entries are **preserved**. Use this to force
+re-issuance; the next TLS handshake per domain requests a fresh certificate.
+
+> ⚠️ Certificates re-issue via ACME on the next handshake — mind the CA's rate limits
+> (Let's Encrypt caps duplicate-certificate issuance per week).
+
+```bash
+# Preview
+./proxybuff clear-certs --config ./config.json
+
+# Actually clear
+./proxybuff clear-certs --config ./config.json --yes
 ```
 
 ## Flags

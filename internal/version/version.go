@@ -8,6 +8,6 @@ package version
 
 const (
 	Project = "ProxyBuff"
-	Version = "v1.4.1"
+	Version = "v1.4.2"
 	Author  = "Quardexus"
 )

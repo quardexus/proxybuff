@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)
-![Release](https://img.shields.io/badge/release-v1.4.0-success)
+![Release](https://img.shields.io/badge/release-v1.4.2-success)
 ![QUARDEXUS](https://img.shields.io/badge/QUARDEXUS-functional%20entity-000000)
 
 ## Features
@@ -80,8 +80,11 @@ ProxyBuff can proactively **refresh** cached entries in the background even when
 How it works:
 
 - You configure `--recache` patterns (same syntax as `--cache`).
+- An entry must first be cached by a request; patterns do not discover or preload URLs.
 - For each cached entry matching `--recache`, ProxyBuff schedules a refresh at:
   - `expiresAt - recacheAhead`
+- An entry that has reached this refresh time is refreshed even while its TTL is still valid.
+  If another request has already renewed it, the next refresh follows its new expiry instead.
 - Refresh is done by a background worker pool (`--recache-workers`) and uses non-blocking per-key locking so it does not stall user traffic.
 - Cached entries survive restarts because the scheduler reads `meta.json` from disk on startup.
 
@@ -89,6 +92,12 @@ Defaults:
 
 - `--recache-ahead=5m`
 - `--recache-workers=4`
+
+For example, `--ttl=24h --recache-ahead=5m` schedules the next refresh about
+23 hours 55 minutes after a successful fill. `recache-ahead` is a lead time,
+not a separate refresh interval. A value of `0` schedules refresh at expiry.
+If the lead time is greater than or equal to a site's TTL, ProxyBuff uses half
+that TTL and logs the adjustment to avoid continuous immediate refreshes.
 
 ## Multi-host (multiple domains and origins)
 

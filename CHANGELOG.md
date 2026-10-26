@@ -5,7 +5,28 @@ All notable changes to **ProxyBuff** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.0] — unreleased
+## [1.4.2] — 2026-10-27
+
+### Fixed
+- Recache now refreshes entries when their refresh-ahead deadline is reached,
+  instead of skipping all entries until their TTL expires and repeatedly scheduling
+  an already-due task. Entries renewed by another request still avoid duplicate fetches.
+- Close cached body files opened while checking whether a background refresh is needed.
+- Publish refreshed bodies and metadata together with respect to cache readers, so
+  concurrent HIT and Range responses cannot combine an old header with a new body.
+  Existing readers can finish their original snapshot during replacement on Windows too.
+- When `recache-ahead` is at least a site's TTL, use half that TTL and log the
+  adjustment so successful refreshes do not immediately trigger another download.
+- Add regression coverage for early refresh, concurrent renewal, expired entries,
+  retries, zero/oversized lead times, and background scheduler operation.
+
+## [1.4.1] — 2026-07-07
+
+### Added
+- `clear-cache` and `clear-certs` commands, with previews unless `--yes` is passed.
+  Clearing HTTP entries preserves certificates, and clearing certificates preserves HTTP entries.
+
+## [1.4.0] — 2026-07-04
 
 ### Added
 - **Multi-host routing.** A single instance can serve multiple domains, each with its own
@@ -63,7 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release: caching reverse proxy with a disk-backed TTL cache and path-pattern matching.
 
-[1.4.0]: https://github.com/quardexus/proxybuff/compare/v1.3.2...HEAD
+[1.4.2]: https://github.com/quardexus/proxybuff/compare/ac5a3bc...v1.4.2
+[1.4.1]: https://github.com/quardexus/proxybuff/compare/c1902f6...ac5a3bc
+[1.4.0]: https://github.com/quardexus/proxybuff/compare/v1.3.2...c1902f6
 [1.3.2]: https://github.com/quardexus/proxybuff/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/quardexus/proxybuff/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/quardexus/proxybuff/compare/v1.2.0...v1.3.0

@@ -41,18 +41,15 @@ func TestKeyHashDistinctAndStable(t *testing.T) {
 
 func writeEntry(t *testing.T, d Disk, key string, expiresAt time.Time) {
 	t.Helper()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := d.PrepareWrite(key)
+	_, _, tmpBody, _, _, _, err := d.PrepareWrite(key)
 	if err != nil {
 		t.Fatalf("PrepareWrite(%s): %v", key, err)
 	}
 	if err := os.WriteFile(tmpBody, []byte("body"), 0o644); err != nil {
 		t.Fatalf("write tmp body: %v", err)
 	}
-	if err := os.Rename(tmpBody, bodyFinal); err != nil {
-		t.Fatalf("rename body: %v", err)
-	}
-	if err := d.WriteMeta(tmpMeta, metaFinal, &Meta{Path: "/" + key, ExpiresAt: expiresAt, Size: 4}); err != nil {
-		t.Fatalf("WriteMeta: %v", err)
+	if err := d.Commit(key, &Meta{Path: "/" + key, ExpiresAt: expiresAt, Size: 4}); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 }
 

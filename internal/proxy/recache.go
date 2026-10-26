@@ -54,6 +54,13 @@ func newRecacheScheduler(siteID string, disk cache.Disk, origin *url.URL, client
 	if ahead < 0 {
 		ahead = 0
 	}
+	if ttl > 0 && ahead >= ttl {
+		// A lead time covering the whole lifetime would make every new entry
+		// immediately due again. Keep refresh-ahead useful for short TTLs.
+		effectiveAhead := ttl / 2
+		log.Printf("recache: site=%q ahead=%s is not shorter than ttl=%s; using effective ahead=%s", siteID, ahead, ttl, effectiveAhead)
+		ahead = effectiveAhead
+	}
 	s := &recacheScheduler{
 		siteID:   siteID,
 		disk:     disk,
@@ -218,9 +225,14 @@ func (s *recacheScheduler) refreshOne(ctx context.Context, k cache.Key) {
 
 	// If it got refreshed by user traffic while we were waiting in queue,
 	// reading meta here avoids extra origin hit.
-	meta, _, fresh, err := s.disk.LoadFresh(keyHash, time.Now())
-	if err == nil && fresh {
-		// Still schedule the next refresh based on current expiry.
+	now := time.Now()
+	meta, body, fresh, err := s.disk.LoadFresh(keyHash, now)
+	if body != nil {
+		_ = body.Close()
+	}
+	if err == nil && fresh && meta.ExpiresAt.Add(-s.ahead).After(now) {
+		// A fresh entry can still be due for refresh-ahead. Only skip it when
+		// the latest metadata puts its refresh deadline in the future.
 		s.finishTaskAndReschedule(k, meta.ExpiresAt.Add(-s.ahead))
 		return
 	}
@@ -303,7 +315,7 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, k cache.Key) (time.
 
 	now := time.Now()
 	key := k.Hash()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := s.disk.PrepareWrite(key)
+	_, _, tmpBody, tmpMeta, _, _, err := s.disk.PrepareWrite(key)
 	if err != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return time.Time{}, err
@@ -326,12 +338,6 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, k cache.Key) (time.
 		return time.Time{}, err
 	}
 
-	if err := os.Rename(tmpBody, bodyFinal); err != nil {
-		_ = os.Remove(tmpBody)
-		_ = os.Remove(tmpMeta)
-		return time.Time{}, err
-	}
-
 	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(n, 10))
 	expiresAt := now.Add(s.ttl)
@@ -347,9 +353,7 @@ func (s *recacheScheduler) fetchToCache(ctx context.Context, k cache.Key) (time.
 		Size:      n,
 	}
 
-	if err := s.disk.WriteMeta(tmpMeta, metaFinal, meta); err != nil {
-		_ = os.Remove(metaFinal)
-		_ = os.Remove(bodyFinal)
+	if err := s.disk.Commit(key, meta); err != nil {
 		return time.Time{}, err
 	}
 

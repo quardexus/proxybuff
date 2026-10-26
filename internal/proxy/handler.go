@@ -604,7 +604,11 @@ func (h *Handler) maybeFillFullInBackground(s *site, r *http.Request) {
 		defer unlock()
 
 		// If another request filled it while we were queued to run, avoid extra origin hit.
-		if _, _, fresh, err := h.cacheDisk.LoadFresh(key, time.Now()); err == nil && fresh {
+		_, body, fresh, err := h.cacheDisk.LoadFresh(key, time.Now())
+		if body != nil {
+			_ = body.Close()
+		}
+		if err == nil && fresh {
 			return
 		}
 
@@ -650,7 +654,7 @@ func (h *Handler) fetchFullToCache(s *site, src *http.Request, k cache.Key) {
 
 	now := time.Now()
 	key := k.Hash()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(key)
+	_, _, tmpBody, tmpMeta, _, _, err := h.cacheDisk.PrepareWrite(key)
 	if err != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return
@@ -671,12 +675,6 @@ func (h *Handler) fetchFullToCache(s *site, src *http.Request, k cache.Key) {
 		return
 	}
 
-	if err := os.Rename(tmpBody, bodyFinal); err != nil {
-		_ = os.Remove(tmpBody)
-		_ = os.Remove(tmpMeta)
-		return
-	}
-
 	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(n, 10))
 
@@ -692,9 +690,7 @@ func (h *Handler) fetchFullToCache(s *site, src *http.Request, k cache.Key) {
 		Size:      n,
 	}
 
-	if err := h.cacheDisk.WriteMeta(tmpMeta, metaFinal, meta); err != nil {
-		_ = os.Remove(metaFinal)
-		_ = os.Remove(bodyFinal)
+	if err := h.cacheDisk.Commit(key, meta); err != nil {
 		return
 	}
 
@@ -793,7 +789,7 @@ func (h *Handler) fetchAndCache(s *site, w http.ResponseWriter, r *http.Request,
 	// Prepare cache write.
 	now := time.Now()
 	key := k.Hash()
-	_, _, tmpBody, tmpMeta, bodyFinal, metaFinal, err := h.cacheDisk.PrepareWrite(key)
+	_, _, tmpBody, tmpMeta, _, _, err := h.cacheDisk.PrepareWrite(key)
 	if err != nil {
 		// Can't cache; just proxy body.
 		_, _ = io.Copy(w, resp.Body)
@@ -932,12 +928,6 @@ func (h *Handler) fetchAndCache(s *site, w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Rename and save meta...
-	if err := os.Rename(tmpBody, bodyFinal); err != nil {
-		_ = os.Remove(tmpBody)
-		return
-	}
-
 	storedHeader := storedResponseHeader(resp.Header)
 	storedHeader.Set("Content-Length", strconv.FormatInt(cachedBytes, 10))
 
@@ -953,9 +943,7 @@ func (h *Handler) fetchAndCache(s *site, w http.ResponseWriter, r *http.Request,
 		Size:      cachedBytes,
 	}
 
-	if err := h.cacheDisk.WriteMeta(tmpMeta, metaFinal, meta); err != nil {
-		_ = os.Remove(metaFinal)
-		_ = os.Remove(bodyFinal)
+	if err := h.cacheDisk.Commit(key, meta); err != nil {
 		return
 	}
 

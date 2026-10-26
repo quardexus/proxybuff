@@ -18,8 +18,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+// Disk values are copied into handlers and schedulers, so publication must use
+// a shared lock. Readers only hold it until the metadata/body snapshot is open;
+// downloads, cache-body writes, and responses never run under this lock.
+var publicationMu sync.RWMutex
 
 type Meta struct {
 	Path      string      `json:"path"`
@@ -85,6 +91,8 @@ func (d Disk) Paths(key string) (dir, bodyPath, metaPath string) {
 
 func (d Disk) LoadFresh(key string, now time.Time) (*Meta, *os.File, bool, error) {
 	_, bodyPath, metaPath := d.Paths(key)
+	publicationMu.RLock()
+	defer publicationMu.RUnlock()
 
 	meta, err := readMeta(metaPath)
 	if err != nil {
@@ -94,15 +102,14 @@ func (d Disk) LoadFresh(key string, now time.Time) (*Meta, *os.File, bool, error
 		return nil, nil, false, err
 	}
 	if now.After(meta.ExpiresAt) {
-		_ = os.Remove(metaPath)
-		_ = os.Remove(bodyPath)
+		// GC removes expired entries under the publication lock. A read must
+		// not delete an entry which a concurrent refresh is replacing.
 		return nil, nil, false, nil
 	}
 
-	f, err := os.Open(bodyPath)
+	f, err := openBody(bodyPath)
 	if err != nil {
 		// meta exists but body is missing/corrupt; treat as miss
-		_ = os.Remove(metaPath)
 		return nil, nil, false, nil
 	}
 	return meta, f, true, nil
@@ -118,7 +125,17 @@ func (d Disk) PrepareWrite(key string) (_ string, dir string, tmpBody string, tm
 	return key, dir, tmpBody, tmpMeta, bodyFinal, metaFinal, nil
 }
 
-func (d Disk) WriteMeta(tmpMeta, metaFinal string, m *Meta) error {
+// Commit publishes a completely written body.tmp and its metadata as one
+// snapshot for LoadFresh. Writers for the same key must already be serialized.
+// Metadata preparation errors leave the old entry intact. Once publication
+// begins, a failure leaves a cache miss rather than mixed body/metadata versions.
+func (d Disk) Commit(key string, m *Meta) error {
+	dir, bodyFinal, metaFinal := d.Paths(key)
+	tmpBody := filepath.Join(dir, "body.tmp")
+	tmpMeta := filepath.Join(dir, "meta.json.tmp")
+	defer os.Remove(tmpBody)
+	defer os.Remove(tmpMeta)
+
 	b, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("marshal meta: %w", err)
@@ -126,7 +143,19 @@ func (d Disk) WriteMeta(tmpMeta, metaFinal string, m *Meta) error {
 	if err := os.WriteFile(tmpMeta, append(b, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write meta: %w", err)
 	}
+
+	publicationMu.Lock()
+	defer publicationMu.Unlock()
+	// Retire metadata first so an interrupted publication cannot leave old
+	// headers describing the new body after a process restart.
+	if err := os.Remove(metaFinal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("retire meta: %w", err)
+	}
+	if err := replaceBody(tmpBody, bodyFinal); err != nil {
+		return fmt.Errorf("rename body: %w", err)
+	}
 	if err := os.Rename(tmpMeta, metaFinal); err != nil {
+		_ = os.Remove(bodyFinal)
 		return fmt.Errorf("rename meta: %w", err)
 	}
 	return nil
@@ -159,6 +188,10 @@ func (d Disk) SweepExpired(now time.Time) (deleted int, err error) {
 			return nil
 		}
 
+		publicationMu.Lock()
+		defer publicationMu.Unlock()
+		// Re-read expiry while publication is excluded: a refresh may have
+		// replaced this entry since WalkDir discovered its metadata file.
 		meta, readErr := readMeta(p)
 		if readErr != nil {
 			return nil
@@ -221,6 +254,8 @@ func (d Disk) ClearCache() (deleted int, err error) {
 			return nil
 		}
 
+		publicationMu.Lock()
+		defer publicationMu.Unlock()
 		dir := filepath.Dir(p)
 		bodyPath := filepath.Join(dir, "body")
 		_ = os.Remove(p)

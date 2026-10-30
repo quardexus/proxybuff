@@ -28,6 +28,7 @@ import (
 	"github.com/quardexus/proxybuff/internal/cache"
 	"github.com/quardexus/proxybuff/internal/config"
 	"github.com/quardexus/proxybuff/internal/proxy"
+	"github.com/quardexus/proxybuff/internal/proxyproto"
 	"github.com/quardexus/proxybuff/internal/version"
 )
 
@@ -129,7 +130,9 @@ Flags:
   --age-header  Add standard Age header on cache HIT (optional)
   --use-origin-host  Send Host header from --origin (default: forward original client Host)
   --insecure-skip-verify  Skip TLS certificate verification for https origins (dangerous)
-  --config      Read JSON config file (unknown keys rejected)
+  --proxy-protocol-from   IP/CIDR(s) that must send a PROXY protocol v1/v2 header, e.g. an edge nginx
+                          stream proxy (repeatable or comma-separated); the header's client IP is used
+  --config     Read JSON config file (unknown keys rejected)
   --write-effective-config  Write effective config JSON to a file (for Docker entrypoint)
 
 `, version.Project, version.Version, version.Author)
@@ -189,9 +192,13 @@ func writeEffectiveConfig(path string, cfg config.Config) error {
 		CacheVaryHost      bool       `json:"cacheVaryHost"`
 		CacheKeyQuery      bool       `json:"cacheKeyQuery"`
 		Hosts              []fileHost `json:"hosts,omitempty"`
+		ProxyProtocolFrom  []string   `json:"proxyProtocolFrom,omitempty"`
+		ProxyProtocolOn    string     `json:"proxyProtocolOn,omitempty"`
 	}
 
 	payload := fileCfg{
+		ProxyProtocolFrom:  cfg.ProxyProtocolFrom,
+		ProxyProtocolOn:    cfg.ProxyProtocolOn,
 		Listen:             cfg.Listen,
 		HTTPEnabled:        cfg.HTTPEnabled,
 		HttpListen:         cfg.HttpListen,
@@ -274,6 +281,50 @@ func runServers(ctx context.Context, cfg config.Config, h *proxy.Handler) error 
 		}
 	}
 
+	ppAllow, err := cfg.ProxyProtocolAllowList()
+	if err != nil {
+		return err
+	}
+	httpRejectHint := ""
+	ppHTTP := ppAllow.Len() > 0 && cfg.ProxyProtocolOnHTTP()
+	if ppAllow.Len() > 0 {
+		on := "http and https listeners"
+		if !ppHTTP {
+			on = "the https listener only"
+		}
+		log.Printf("proxy protocol: required from %s on %s (other peers are served without it); client X-Forwarded-For/X-Real-IP/Forwarded headers are replaced, not extended", ppAllow, on)
+		for _, p := range ppAllow.Wide() {
+			log.Printf("WARNING: proxy protocol: %s trusts more than one address; any peer in it (e.g. the Docker network gateway used by published ports, or another container) can choose its client IP. Prefer the edge proxy's single IP.", p)
+		}
+		httpRejectHint = "http listener: the edge must send PROXY protocol on this port too (nginx stream with proxy_protocol on; the nginx http module cannot); or set proxyProtocolOn=https"
+		if certMgr != nil && ppHTTP {
+			httpRejectHint += ", otherwise ACME HTTP-01 challenges fail and certificates will not be issued or renewed"
+			log.Printf("proxy protocol: the http listener %s serves ACME HTTP-01 challenges; the edge must forward it with PROXY protocol too or certificate issuance/renewal will fail", cfg.HttpListen)
+		}
+	}
+	// listen opens a raw TCP listener and, when configured, wraps it with the
+	// PROXY protocol reader. The wrapper sits below TLS, so the header is
+	// consumed before the ClientHello.
+	var listeners []net.Listener
+	listen := func(addr, rejectHint string, requireProxy bool) (net.Listener, error) {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		if requireProxy {
+			pl := proxyproto.NewListener(ln, ppAllow)
+			pl.RejectHint = rejectHint
+			ln = pl
+		}
+		listeners = append(listeners, ln)
+		return ln, nil
+	}
+	closeListeners := func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}
+
 	errCh := make(chan error, 3)
 	started := 0
 	var servers []*http.Server
@@ -293,10 +344,15 @@ func runServers(ctx context.Context, cfg config.Config, h *proxy.Handler) error 
 			ReadHeaderTimeout: 15 * time.Second,
 			IdleTimeout:       60 * time.Second,
 		}
+		ln, err := listen(cfg.HttpListen, httpRejectHint, ppHTTP)
+		if err != nil {
+			closeListeners()
+			return fmt.Errorf("http listen: %w", err)
+		}
 		servers = append(servers, srv)
 		started++
 		go func() {
-			err := srv.ListenAndServe()
+			err := srv.Serve(ln)
 			if err != nil && err != http.ErrServerClosed {
 				errCh <- fmt.Errorf("http listen: %w", err)
 			}
@@ -311,11 +367,16 @@ func runServers(ctx context.Context, cfg config.Config, h *proxy.Handler) error 
 			ReadHeaderTimeout: 15 * time.Second,
 			IdleTimeout:       60 * time.Second,
 		}
+		ln, err := listen(cfg.HttpsListen, "", ppAllow.Len() > 0)
+		if err != nil {
+			closeListeners()
+			return fmt.Errorf("https listen: %w", err)
+		}
 		servers = append(servers, httpsSrv)
 		started++
 		log.Printf("https enabled: listen=%s", cfg.HttpsListen)
 		go func() {
-			err := httpsSrv.ListenAndServeTLS("", "")
+			err := httpsSrv.ServeTLS(ln, "", "")
 			if err != nil && err != http.ErrServerClosed {
 				errCh <- fmt.Errorf("https listen: %w", err)
 			}

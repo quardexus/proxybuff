@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)
-![Release](https://img.shields.io/badge/release-v1.4.2-success)
+![Release](https://img.shields.io/badge/release-v1.5.0-success)
 ![QUARDEXUS](https://img.shields.io/badge/QUARDEXUS-functional%20entity-000000)
 
 ## Features
@@ -14,6 +14,7 @@
 - **Automatic TLS** — Let's Encrypt certificates via ACME HTTP-01, auto-issued and auto-renewed per hostname.
 - **Range requests** — a single range (`206`) is served straight from cached files; the full file is back-filled in the background.
 - **Refresh-ahead (recache)** — configured entries are refreshed in the background before they expire, even with no traffic.
+- **PROXY protocol** — keeps the real client IP behind an L4 proxy (nginx `stream`, HAProxy); v1 and v2, accepted only from configured peers.
 - **Safe by default** — never caches authenticated or `no-store`/`private` responses, never stores or replays `Set-Cookie`; Slowloris-resistant timeouts.
 - **Single static binary** — pure Go, no CGO; Linux / macOS / Windows on amd64 & arm64.
 
@@ -21,7 +22,7 @@
 
 - [What it does](#what-it-does) · [Caching rules](#caching-rules-v140) · [Cache patterns](#cache-patterns)
 - [Recache](#auto-refresh-cache-recache) · [Multi-host](#multi-host-multiple-domains-and-origins)
-- [Build](#install--build-locally) · [Run](#run-locally-binary) · [Docker](#docker) · [Status](#status-command) · [Clear](#clear-commands) · [Flags](#flags)
+- [Build](#install--build-locally) · [Run](#run-locally-binary) · [Docker](#docker) · [PROXY protocol](#behind-nginx-stream--proxy-protocol) · [Status](#status-command) · [Clear](#clear-commands) · [Flags](#flags)
 - [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 _By **QUARDEXUS · functional entity** — licensed under [Apache-2.0](LICENSE)._
@@ -236,6 +237,124 @@ docker run -d --name proxybuff \
   --tls-domain public.example.com
 ```
 
+### Behind nginx stream / PROXY protocol
+
+When ProxyBuff sits behind an L4 proxy (for example an edge nginx that routes by SNI with
+`ssl_preread` and passes TLS through untouched), every connection arrives from the proxy's
+address. Anything downstream that relies on the client IP — brute-force throttling in an IAM,
+rate limits, audit logs — would then see one address for everybody. Enable the PROXY protocol
+on the proxy and tell ProxyBuff which peers send it:
+
+```bash
+proxybuff --origin https://iam.internal:8443 --https=443 --http=80 \
+  --tls-domain auth.example.com \
+  --proxy-protocol-from 172.30.0.10
+```
+
+or in `config.json`: `"proxyProtocolFrom": ["172.30.0.10"]`. Here `172.30.0.10` is the edge
+nginx's **own** address (see the Docker setup below). Blank entries (for example an unset
+environment variable in `--proxy-protocol-from "$PP_FROM"`) are an error, not "off".
+
+How it works:
+
+- Applies to **both** the HTTP and HTTPS listeners. The header is read on the raw TCP
+  connection **before TLS**, so TLS is still terminated by ProxyBuff and ACME HTTP-01 keeps working.
+- A connection from a listed IP/CIDR **must** begin with a PROXY v1 or v2 header within
+  5 seconds. Its source address becomes the request's client address. `PROXY UNKNOWN` (v1) and
+  `LOCAL` (v2, health checks) keep the proxy's own address. A missing, malformed or late header
+  closes the connection; rejections are logged at most once per 10 seconds.
+- ProxyBuff becomes the **first HTTP hop** (nginx `stream` forwards no HTTP headers), so it owns
+  the forwarding headers: any `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`
+  and `X-Forwarded-Proto` sent by the client are **removed** and replaced with values built from
+  the verified client address — `X-Forwarded-For: <ip>`, `X-Real-IP: <ip>`,
+  `Forwarded: for=<ip>;proto=…;host=…` — on every path to the origin (pass-through, cache fill,
+  background range fill). This is the equivalent of nginx's
+  `proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $remote_addr;`.
+  Without `--proxy-protocol-from` the historical behaviour (append to `X-Forwarded-For`) is kept.
+- A connection from **any other** IP is served as before and its bytes are never parsed, so a
+  client cannot spoof its address by sending its own `PROXY` line (it is just invalid HTTP/TLS).
+- List **only** the proxy's own addresses — ideally single IPs. Every peer inside a listed range
+  can choose its client IP by sending its own `PROXY` line. A Docker network's subnet (e.g.
+  `172.18.0.0/16`) includes its **gateway** (`.1`, the source address of connections relayed
+  by `docker-proxy` for published ports — host-local, IPv6 and hairpin traffic) and **every
+  other container** on that network, including the IAM itself; do not list it. ProxyBuff logs a
+  startup warning for every entry wider than one address.
+- Do not publish ProxyBuff's ports (`-p 80:80 -p 443:443`) once the edge proxy fronts it; only
+  the edge should be able to connect.
+- The header is read in the connection's own goroutine, so a slow or silent peer never blocks
+  `Accept` for others.
+
+Because the proxy must send the header on **both** ports, route port 80 through the `stream`
+module too (the `http` module cannot emit the PROXY protocol). Give the edge a fixed address on
+a dedicated network and trust only that address:
+
+```yaml
+# docker-compose.yml (excerpt)
+networks:
+  edge:                     # nginx <-> proxybuff only
+    ipam:
+      config: [{ subnet: 172.30.0.0/24 }]
+  backend: {}               # proxybuff <-> origin (IAM); nginx is not on it
+services:
+  nginx:                    # the only service with published ports
+    ports: ["80:80", "443:443"]
+    networks:
+      edge: { ipv4_address: 172.30.0.10 }
+  proxybuff:                # no "ports:" here
+    command: ["--proxy-protocol-from", "172.30.0.10", "..."]
+    networks: [edge, backend]
+```
+
+nginx and ProxyBuff should share **only** that network, so nginx always connects from
+`172.30.0.10`.
+
+Example edge nginx (`nginx.conf`, top level, requires `ngx_stream_ssl_preread_module`):
+
+```nginx
+stream {
+    map $ssl_preread_server_name $tls_upstream {
+        auth.example.com  proxybuff_tls;
+        default           other_tls;
+    }
+
+    upstream proxybuff_tls  { server proxybuff:443; }
+    upstream proxybuff_http { server proxybuff:80; }
+    upstream other_tls      { server 10.0.0.20:443; }
+
+    # :443 — SNI passthrough; TLS is terminated by ProxyBuff.
+    server {
+        listen 443;
+        ssl_preread    on;
+        proxy_pass     $tls_upstream;
+        proxy_protocol on;   # PROXY v1 header before the ClientHello
+    }
+
+    # :80 — ACME HTTP-01 challenges and HTTP->HTTPS redirects.
+    server {
+        listen 80;
+        proxy_pass     proxybuff_http;
+        proxy_protocol on;
+    }
+}
+```
+
+`other_tls` stands for any other backend on the same edge; it receives the header too, so
+either enable PROXY protocol there as well or move it to a separate `server` without
+`proxy_protocol on`. By default the trusted list applies to both listeners, so `:80` must also
+reach ProxyBuff through `stream` with `proxy_protocol on`; connections from the nginx `http` module
+carry no header and are refused. That listener answers ACME HTTP-01 challenges, so issuance and
+renewal would fail silently until the certificate expires; ProxyBuff says so at startup and in its
+rejection log lines.
+
+If the edge must route `:80` by `Host` (several services behind one nginx), forward it with the
+`http` module and start ProxyBuff with `--proxy-protocol-on https` (JSON `"proxyProtocolOn": "https"`):
+the header is then required on the HTTPS listener only. With HTTPS enabled the HTTP listener only
+answers ACME challenges and redirects to HTTPS, so it never proxies a request to the origin.
+
+Note for downstream services (IAM): trust `X-Real-IP` / `X-Forwarded-For` / `Forwarded` **only
+from ProxyBuff's address** (one trusted hop). ProxyBuff overwrites them, so each carries exactly
+the verified client IP; a client that connects to the IAM directly could still send its own.
+
 ### Clear cache (inside container)
 
 ```bash
@@ -318,6 +437,8 @@ re-issuance; the next TLS handshake per domain requests a fresh certificate.
 - `--insecure-skip-verify` (default `false`): skip TLS certificate verification for https origins (dangerous)
 - `--cache-vary-host` (default `true`): include the request `Host` in the cache key. Disable with `--cache-vary-host=false`.
 - `--cache-key-query` (default `true`): include the query string in the cache key. Disable with `--cache-key-query=false`.
+- `--proxy-protocol-from` (repeatable or comma-separated, default empty): IPs/CIDRs (IPv4 or IPv6) whose connections **must** start with a PROXY protocol v1/v2 header on both listeners; the header's client address is used. Other peers are served without parsing. When set, client-supplied `X-Forwarded-For`/`X-Real-IP`/`Forwarded` headers are replaced, not extended. Invalid or blank entries fail startup. JSON: `"proxyProtocolFrom": [...]`. See [Behind nginx stream / PROXY protocol](#behind-nginx-stream--proxy-protocol).
+- `--proxy-protocol-on` (default `both`): listeners that require the PROXY header, `both` or `https`. `https` needs HTTPS enabled and lets an nginx `http` block forward `:80` (ACME + redirects) by `Host`. JSON: `"proxyProtocolOn": "https"`.
 
 > Multi-host routing (several domains/origins from one instance) is configured via the JSON config file — see [Multi-host](#multi-host-multiple-domains-and-origins).
 

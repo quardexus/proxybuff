@@ -5,6 +5,48 @@ All notable changes to **ProxyBuff** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-10-31
+
+### Added
+- **PROXY protocol (v1 and v2) from trusted peers.** `--proxy-protocol-from` (repeatable or
+  comma-separated IPs/CIDRs) and the JSON field `proxyProtocolFrom` let ProxyBuff run behind an
+  L4 proxy such as nginx `stream` with `ssl_preread` + `proxy_protocol on`. The header is read
+  on both the HTTP and HTTPS listeners, below TLS (so ACME/autocert keeps working), and its
+  client address becomes the request `RemoteAddr` and therefore the `X-Forwarded-For` value
+  sent to the origin. Empty (the default) leaves behaviour unchanged.
+- `--proxy-protocol-on` / JSON `proxyProtocolOn` (`both` by default, or `https`): require the
+  header on the HTTPS listener only, so an edge can forward `:80` (ACME HTTP-01 + redirects) by
+  `Host` with the nginx `http` module. `https` requires HTTPS to be enabled.
+- Startup warnings for `proxyProtocolFrom` entries wider than one address (e.g. a whole Docker
+  subnet, which includes the gateway used by `docker-proxy` and every sibling container), and a
+  notice that the HTTP listener (ACME HTTP-01) must receive the PROXY header too; rejection log
+  lines on that listener say so as well.
+
+### Security
+- Connections from listed peers **must** start with a valid header within 5 seconds; a missing,
+  malformed, oversized or late header closes the connection (rejections are logged at most once
+  per 10 seconds). Connections from all other peers are never parsed, so a `PROXY` line sent by
+  an untrusted client cannot spoof its address.
+- Strict parsing: v1 is limited to 107 bytes with exact field counts, address families that match
+  `TCP4`/`TCP6`, and plain decimal ports; v2 requires the exact signature, version 2, a
+  `LOCAL`/`PROXY` command, TCP over IPv4/IPv6 (or `UNSPEC`), and a payload of at most 2048 bytes
+  (TLVs are skipped). Header parsing happens per connection, so a slow peer cannot stall `Accept`.
+- Invalid `proxyProtocolFrom` entries fail startup with an error naming the entry; blank entries
+  (an unset variable in `--proxy-protocol-from "$X"`, `""` in JSON, a stray comma) are rejected
+  instead of silently turning the feature off.
+- With `proxyProtocolFrom` set, ProxyBuff is the first HTTP hop and **owns the forwarding
+  headers**: client-supplied `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host` and
+  `X-Forwarded-Proto` are dropped and rebuilt from the verified client address
+  (`X-Forwarded-For`/`X-Real-IP: <ip>`, `Forwarded: for=…;proto=…;host=…`) on the pass-through,
+  cache-fill and background range-fill paths, so a client cannot pick the IP an IAM throttles on.
+  `Connection:` tokens naming these headers are ignored so they cannot be stripped. Without the
+  option the previous append behaviour is unchanged, except that background range fills now send
+  `X-Forwarded-For`/`-Host`/`-Proto` like every other origin request.
+
+### Performance
+- Trusted PROXY-protocol connections keep `io.ReaderFrom`, so cache hits on plain HTTP still use
+  `sendfile`.
+
 ## [1.4.2] — 2026-10-27
 
 ### Fixed
@@ -84,6 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release: caching reverse proxy with a disk-backed TTL cache and path-pattern matching.
 
+[1.5.0]: https://github.com/quardexus/proxybuff/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/quardexus/proxybuff/compare/ac5a3bc...v1.4.2
 [1.4.1]: https://github.com/quardexus/proxybuff/compare/c1902f6...ac5a3bc
 [1.4.0]: https://github.com/quardexus/proxybuff/compare/v1.3.2...c1902f6

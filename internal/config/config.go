@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/quardexus/proxybuff/internal/proxyproto"
 )
 
 type Config struct {
@@ -55,7 +57,31 @@ type Config struct {
 	// exactly as a single-origin proxy (backward compatible).
 	Hosts []HostConfig `json:"hosts,omitempty"`
 
+	// ProxyProtocolFrom lists IPs/CIDRs (e.g. an edge nginx stream proxy)
+	// whose connections must start with a PROXY protocol v1/v2 header on both
+	// the HTTP and HTTPS listeners. The header's client address then becomes
+	// the request's RemoteAddr (and X-Forwarded-For). Connections from other
+	// peers are served as-is and any PROXY header they send is not honored.
+	// Empty disables the feature.
+	ProxyProtocolFrom []string `json:"proxyProtocolFrom,omitempty"`
+
+	// ProxyProtocolOn selects the listeners that require the PROXY header:
+	// "both" (default) or "https". Use "https" when the edge forwards :80
+	// with its HTTP module (Host routing, ACME), which cannot send the header;
+	// with HTTPS enabled that listener only serves ACME and redirects.
+	ProxyProtocolOn string `json:"proxyProtocolOn,omitempty"`
+
 	LogFile string `json:"logFile"`
+}
+
+const (
+	ProxyProtocolOnBoth  = "both"
+	ProxyProtocolOnHTTPS = "https"
+)
+
+// ProxyProtocolOnHTTP reports whether the HTTP listener requires the header.
+func (c *Config) ProxyProtocolOnHTTP() bool {
+	return c.ProxyProtocolOn != ProxyProtocolOnHTTPS
 }
 
 // HostConfig is a fully-resolved per-host routing target. It is produced by
@@ -130,7 +156,29 @@ func (c *Config) Validate() error {
 	if c.RecacheWorkers < 0 {
 		return errors.New("recacheWorkers must be >= 0")
 	}
+	if _, err := c.ProxyProtocolAllowList(); err != nil {
+		return err
+	}
+	switch c.ProxyProtocolOn {
+	case "", ProxyProtocolOnBoth:
+	case ProxyProtocolOnHTTPS:
+		if !c.HTTPSEnabled {
+			return errors.New("proxyProtocolOn=https requires https to be enabled")
+		}
+	default:
+		return fmt.Errorf("proxyProtocolOn: invalid value %q (use %q or %q)", c.ProxyProtocolOn, ProxyProtocolOnBoth, ProxyProtocolOnHTTPS)
+	}
 	return nil
+}
+
+// ProxyProtocolAllowList parses ProxyProtocolFrom. An empty list yields an
+// empty AllowList (feature off).
+func (c *Config) ProxyProtocolAllowList() (proxyproto.AllowList, error) {
+	al, err := proxyproto.ParseAllowList(c.ProxyProtocolFrom)
+	if err != nil {
+		return proxyproto.AllowList{}, fmt.Errorf("proxyProtocolFrom: %w", err)
+	}
+	return al, nil
 }
 
 func (c *Config) totalTLSDomains() int {
@@ -172,6 +220,8 @@ func Parse(args []string) (Config, error) {
 		cacheMulti     multiString
 		recacheMulti   multiString
 		tlsDomainMulti multiString
+		proxyProtoFrom strictList
+		proxyProtoOn   string
 		fileExplicit   fileExplicit
 	)
 
@@ -200,6 +250,8 @@ func Parse(args []string) (Config, error) {
 	fs.Var(&cacheMulti, "cache", "cache path patterns (repeatable). '*' matches any chars including '/'. '/' caches only root path.")
 	fs.BoolVar(&cacheVaryHost, "cache-vary-host", cfg.CacheVaryHost, "include the request Host in the cache key (default true; disable with --cache-vary-host=false)")
 	fs.BoolVar(&cacheKeyQuery, "cache-key-query", cfg.CacheKeyQuery, "include the query string in the cache key (default true; disable with --cache-key-query=false)")
+	fs.Var(&proxyProtoFrom, "proxy-protocol-from", "IP/CIDR(s) whose connections must send a PROXY protocol v1/v2 header (repeatable or comma-separated)")
+	fs.StringVar(&proxyProtoOn, "proxy-protocol-on", "", "listeners that require the PROXY header: both (default) or https")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -275,6 +327,16 @@ func Parse(args []string) (Config, error) {
 	if visited["cache-key-query"] {
 		cfg.CacheKeyQuery = cacheKeyQuery
 	}
+	if visited["proxy-protocol-from"] {
+		items, err := splitStrictList(proxyProtoFrom.items)
+		if err != nil {
+			return Config{}, fmt.Errorf("proxyProtocolFrom (--proxy-protocol-from): %w", err)
+		}
+		cfg.ProxyProtocolFrom = items
+	}
+	if visited["proxy-protocol-on"] {
+		cfg.ProxyProtocolOn = proxyProtoOn
+	}
 
 	// Ensure recache patterns are also cached.
 	cfg.Cache = mergeUnique(cfg.Cache, cfg.Recache)
@@ -326,6 +388,38 @@ func (m *multiString) Set(v string) error {
 	return nil
 }
 
+// strictList is a repeatable flag that, unlike multiString, keeps blank
+// values so they can be rejected instead of silently ignored.
+type strictList struct {
+	items []string
+}
+
+func (m *strictList) String() string {
+	return strings.Join(m.items, ",")
+}
+
+func (m *strictList) Set(v string) error {
+	m.items = append(m.items, v)
+	return nil
+}
+
+// splitStrictList splits comma-separated values and trims them. A blank item
+// (e.g. an unset environment variable or a stray comma) is an error: for a
+// security list, dropping it silently could turn the feature off unnoticed.
+func splitStrictList(in []string) ([]string, error) {
+	var out []string
+	for _, v := range in {
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				return nil, fmt.Errorf("empty entry in %q", v)
+			}
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
 func normalizeCachePatterns(in []string) []string {
 	var out []string
 	for _, v := range in {
@@ -370,6 +464,8 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 		CacheVaryHost      *bool     `json:"cacheVaryHost"`
 		CacheKeyQuery      *bool     `json:"cacheKeyQuery"`
 		Hosts              []rawHost `json:"hosts"`
+		ProxyProtocolFrom  []string  `json:"proxyProtocolFrom"`
+		ProxyProtocolOn    *string   `json:"proxyProtocolOn"`
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -440,6 +536,16 @@ func readConfigFile(path string) (Config, fileExplicit, error) {
 	}
 	if raw.CacheKeyQuery != nil {
 		cfg.CacheKeyQuery = *raw.CacheKeyQuery
+	}
+	if raw.ProxyProtocolFrom != nil {
+		items, err := splitStrictList(raw.ProxyProtocolFrom)
+		if err != nil {
+			return Config{}, fileExplicit{}, fmt.Errorf("proxyProtocolFrom: %w", err)
+		}
+		cfg.ProxyProtocolFrom = items
+	}
+	if raw.ProxyProtocolOn != nil {
+		cfg.ProxyProtocolOn = *raw.ProxyProtocolOn
 	}
 	exp := fileExplicit{}
 	if raw.InsecureSkipVerify != nil {

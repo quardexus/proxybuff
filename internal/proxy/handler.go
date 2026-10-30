@@ -67,6 +67,12 @@ type Handler struct {
 	cacheDisk   cache.Disk
 	locks       *keyedLocker
 
+	// ownForwarded is set when proxybuff is the first HTTP hop (PROXY protocol
+	// mode): client-supplied X-Forwarded-For, X-Real-IP and Forwarded headers
+	// are discarded and rebuilt from the verified RemoteAddr instead of being
+	// extended, so a client cannot choose the IP the origin sees.
+	ownForwarded bool
+
 	// bgSem bounds the number of concurrent background full-file downloads
 	// triggered by Range misses, to avoid amplification.
 	bgSem chan struct{}
@@ -102,10 +108,11 @@ func New(cfg config.Config) (*Handler, error) {
 	}
 
 	h := &Handler{
-		cfg:       cfg,
-		cacheDisk: cd,
-		locks:     newKeyedLocker(),
-		bgSem:     make(chan struct{}, maxBackgroundFills),
+		cfg:          cfg,
+		cacheDisk:    cd,
+		locks:        newKeyedLocker(),
+		ownForwarded: len(cfg.ProxyProtocolFrom) > 0,
+		bgSem:        make(chan struct{}, maxBackgroundFills),
 	}
 
 	if len(cfg.Hosts) == 0 {
@@ -207,6 +214,7 @@ func (h *Handler) buildSite(spec siteSpec) (*site, error) {
 	rp := httputil.NewSingleHostReverseProxy(u)
 	rp.Transport = transport
 	useOriginHost := spec.useOriginHost
+	ownForwarded := h.ownForwarded
 	origDirector := rp.Director
 	rp.Director = func(req *http.Request) {
 		// Save original host before the default director overwrites it.
@@ -214,6 +222,17 @@ func (h *Handler) buildSite(spec siteSpec) (*site, error) {
 		origDirector(req)
 		if !useOriginHost {
 			req.Host = originalHost
+		}
+		if ownForwarded {
+			// req is the outbound clone; Host/RemoteAddr/TLS still describe
+			// the inbound request here. Leave X-Forwarded-For absent so that
+			// ReverseProxy sets it to the client IP alone (it appends to any
+			// value present).
+			setOwnedForwardedHeaders(req.Header, req, originalHost)
+			req.Header.Del("X-Forwarded-For")
+			// ReverseProxy strips headers named in Connection after the
+			// Director runs; do not let a client drop the ones we just set.
+			dropConnectionTokens(req.Header, ownedForwardedHeaders...)
 		}
 	}
 	client := &http.Client{Transport: transport}
@@ -633,6 +652,7 @@ func (h *Handler) fetchFullToCache(s *site, src *http.Request, k cache.Key) {
 	req.Header.Del("Range")
 	removeHopByHopRequestHeaders(req.Header)
 	req.Header.Set("Accept-Encoding", "identity")
+	h.setForwardedHeaders(req.Header, src)
 
 	// Preserve Host behavior.
 	if s.useOriginHost {
@@ -745,21 +765,7 @@ func (h *Handler) fetchAndCache(s *site, w http.ResponseWriter, r *http.Request,
 	// Ensure cached variants are stable across clients.
 	req.Header.Set("Accept-Encoding", "identity")
 
-	// X-Forwarded-For
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		prior := req.Header.Get("X-Forwarded-For")
-		if prior != "" {
-			req.Header.Set("X-Forwarded-For", prior+", "+ip)
-		} else {
-			req.Header.Set("X-Forwarded-For", ip)
-		}
-	}
-	req.Header.Set("X-Forwarded-Host", r.Host)
-	if r.TLS != nil {
-		req.Header.Set("X-Forwarded-Proto", "https")
-	} else {
-		req.Header.Set("X-Forwarded-Proto", "http")
-	}
+	h.setForwardedHeaders(req.Header, r)
 
 	if s.useOriginHost {
 		req.Host = s.origin.Host
@@ -981,6 +987,128 @@ func copyHeader(dst, src http.Header) {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
+	}
+}
+
+// ownedForwardedHeaders are the client-identifying request headers that
+// proxybuff rebuilds itself in PROXY protocol mode.
+var ownedForwardedHeaders = []string{
+	"X-Forwarded-For",
+	"X-Real-Ip",
+	"Forwarded",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+}
+
+// setForwardedHeaders sets the forwarding headers on an outbound request
+// built from scratch (fetchAndCache, background fills). By default the client
+// IP is appended to any X-Forwarded-For the client sent; in PROXY protocol
+// mode the client's values are discarded and replaced.
+func (h *Handler) setForwardedHeaders(out http.Header, r *http.Request) {
+	if h.ownForwarded {
+		setOwnedForwardedHeaders(out, r, r.Host)
+		return
+	}
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		prior := out.Get("X-Forwarded-For")
+		if prior != "" {
+			out.Set("X-Forwarded-For", prior+", "+ip)
+		} else {
+			out.Set("X-Forwarded-For", ip)
+		}
+	}
+	out.Set("X-Forwarded-Host", r.Host)
+	out.Set("X-Forwarded-Proto", requestProto(r))
+}
+
+// setOwnedForwardedHeaders removes every client-supplied forwarding header and
+// sets X-Forwarded-For, X-Real-IP, Forwarded, X-Forwarded-Host and
+// X-Forwarded-Proto from the verified connection (RemoteAddr comes from the
+// PROXY header for trusted peers, or is the real TCP peer otherwise).
+func setOwnedForwardedHeaders(out http.Header, r *http.Request, host string) {
+	for _, k := range ownedForwardedHeaders {
+		out.Del(k)
+	}
+	proto := requestProto(r)
+	out.Set("X-Forwarded-Host", host)
+	out.Set("X-Forwarded-Proto", proto)
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || ip == "" {
+		return
+	}
+	out.Set("X-Forwarded-For", ip)
+	out.Set("X-Real-IP", ip)
+	forNode := ip
+	if strings.Contains(ip, ":") {
+		forNode = "[" + ip + "]"
+	}
+	fwd := "for=" + forwardedValue(forNode) + ";proto=" + proto
+	if host != "" {
+		fwd += ";host=" + forwardedValue(host)
+	}
+	out.Set("Forwarded", fwd)
+}
+
+func requestProto(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// forwardedValue renders an RFC 7239 value as a token when possible and as a
+// quoted-string otherwise (IPv6 nodes, host:port).
+func forwardedValue(v string) string {
+	token := v != ""
+	for i := 0; i < len(v) && token; i++ {
+		c := v[i]
+		token = c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+	}
+	if token {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(v); i++ {
+		if v[i] == '"' || v[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// dropConnectionTokens removes the named headers from the Connection header's
+// token list so a later hop-by-hop pass cannot delete them.
+func dropConnectionTokens(h http.Header, names ...string) {
+	vv := h.Values("Connection")
+	if len(vv) == 0 {
+		return
+	}
+	var keep []string
+	for _, v := range vv {
+		for _, tok := range strings.Split(v, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			drop := false
+			for _, n := range names {
+				if strings.EqualFold(tok, n) {
+					drop = true
+					break
+				}
+			}
+			if !drop {
+				keep = append(keep, tok)
+			}
+		}
+	}
+	h.Del("Connection")
+	if len(keep) > 0 {
+		h.Set("Connection", strings.Join(keep, ", "))
 	}
 }
 
